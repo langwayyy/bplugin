@@ -2,6 +2,7 @@ package com.kkk.bplugin
 
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.options.ShowSettingsUtil
+import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.popup.JBPopupFactory
 import com.intellij.ui.components.*
@@ -153,11 +154,44 @@ class CryptoPanel(private val project: Project?) : JPanel(BorderLayout(0, JBUI.s
                 if (symbol in settings.rotation) settings.rotation.remove(symbol) else settings.rotation.add(symbol)
                 message.text = "轮播：${settings.rotation.joinToString()}（在设置中启用自动轮播）"
             }
+            add(JMenu("设置静默提醒").apply {
+                AlertCondition.entries.forEach { condition ->
+                    add(JMenuItem(condition.displayName).apply { addActionListener { addAlert(symbol, condition) } })
+                }
+            })
+            val existingRules = CryptoSettings.getInstance().alertRules().filter { it.symbol == symbol }
+            if (existingRules.isNotEmpty()) add(JMenu("删除提醒").apply {
+                existingRules.forEach { rule -> add(JMenuItem(rule.description()).apply { addActionListener {
+                    CryptoSettings.getInstance().saveAlertRules(CryptoSettings.getInstance().alertRules().filterNot { it.id == rule.id })
+                    message.text = "已删除提醒：${rule.description()}"
+                } }) }
+            })
             item("移除自选") { settings.watchlist.remove(symbol); render() }
         }.show(table, e.x, e.y)
     }
+    private fun addAlert(symbol: String, condition: AlertCondition) {
+        val quote = service.quotes[symbol]
+        val initial = when (condition) {
+            AlertCondition.PRICE_ABOVE, AlertCondition.PRICE_BELOW -> quote?.price?.let(::marketPrice).orEmpty()
+            AlertCondition.CHANGE_ABOVE -> "5"
+            AlertCondition.CHANGE_BELOW -> "-5"
+        }
+        val raw = Messages.showInputDialog(project, "输入提醒阈值${if (condition.name.startsWith("CHANGE")) "（%）" else ""}",
+            "${service.pair(symbol) ?: symbol} · ${condition.displayName}", null, initial, null) ?: return
+        val threshold = raw.trim().toBigDecimalOrNull()
+        val valid = threshold != null && when (condition) {
+            AlertCondition.PRICE_ABOVE, AlertCondition.PRICE_BELOW -> threshold.signum() > 0
+            AlertCondition.CHANGE_ABOVE -> threshold.signum() >= 0
+            AlertCondition.CHANGE_BELOW -> threshold.signum() <= 0
+        }
+        if (!valid) { Messages.showErrorDialog(project, "请输入有效阈值；跌幅提醒使用负数，例如 -5。", "无法添加提醒"); return }
+        val rule = CryptoAlertRule(symbol = symbol, condition = condition, threshold = threshold!!)
+        val serviceSettings = CryptoSettings.getInstance()
+        serviceSettings.saveAlertRules(serviceSettings.alertRules() + rule)
+        message.text = "已添加提醒：${rule.description()}"
+    }
     private fun render() {
-        footer.text = service.status()
+        footer.text = service.status() + service.activeAlerts.firstOrNull()?.let { " · ! ${it.message}" }.orEmpty()
         if (catalog !== service.pairs) { catalog = service.pairs; filter() }
         val next = "${settings.watchlist}|${service.quotes}|${settings.decimals}|${settings.color}"
         if (next == fingerprint) return

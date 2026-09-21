@@ -69,6 +69,11 @@ class CryptoUiTest : BasePlatformTestCase() {
                 render(CryptoPanel(project), "watchlist", 1000, 540)
                 val chart = CryptoChartCanvas()
                 render(chart, "chart", 780, 430)
+                val initialViewport = chart.viewportState()
+                chart.dispatchEvent(java.awt.event.MouseWheelEvent(chart, java.awt.event.MouseEvent.MOUSE_WHEEL,
+                    System.currentTimeMillis(), 0, 400, 200, 0, false,
+                    java.awt.event.MouseWheelEvent.WHEEL_UNIT_SCROLL, 1, -1))
+                assertTrue(chart.viewportState().first < initialViewport.first)
                 chart.dispatchEvent(java.awt.event.MouseEvent(chart, java.awt.event.MouseEvent.MOUSE_MOVED,
                     System.currentTimeMillis(), 0, 420, 210, 0, false))
                 render(chart, "chart-crosshair", 780, 430)

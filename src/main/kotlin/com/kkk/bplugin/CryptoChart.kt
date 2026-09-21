@@ -78,6 +78,7 @@ internal class CryptoChartPanel(private val closeWindow: () -> Unit) : JPanel(Bo
             add(JButton("◀").apply { addActionListener { cycle(-1) } })
             add(JButton("▶").apply { addActionListener { cycle(1) } })
             add(JButton("背景开关").apply { addActionListener { settings.background = !settings.background; CryptoBackgrounds.getInstance().sync() } })
+            add(JButton("重置视图").apply { addActionListener { chart.resetViewport() } })
         }, BorderLayout.NORTH)
         add(chart, BorderLayout.CENTER)
         add(JPanel(BorderLayout(8, 0)).apply {
@@ -121,19 +122,47 @@ internal class CryptoChartPanel(private val closeWindow: () -> Unit) : JPanel(Bo
 class CryptoChartCanvas(private val watermark: Boolean = false) : JComponent() {
     private var visibleBars: List<KlineBar> = emptyList()
     private var crosshair: Point? = null
+    private var visibleCount = 90
+    private var historyOffset = 0
+    private var dragAnchorX: Int? = null
+    private var dragAnchorOffset = 0
+    private var lastStride = 1.0
+    private var lastDataSize = 0
+    private var lastDataKey = ""
     init {
         isOpaque = false
         if (!watermark) {
             toolTipText = "K线"
             addMouseMotionListener(object : MouseMotionAdapter() {
                 override fun mouseMoved(event: MouseEvent) { crosshair = event.point; repaint() }
-                override fun mouseDragged(event: MouseEvent) { crosshair = event.point; repaint() }
+                override fun mouseDragged(event: MouseEvent) {
+                    crosshair = event.point
+                    dragAnchorX?.let { anchor ->
+                        historyOffset = (dragAnchorOffset + ((event.x - anchor) / lastStride).roundToInt())
+                            .coerceIn(0, (lastDataSize - 20).coerceAtLeast(0))
+                    }
+                    repaint()
+                }
             })
             addMouseListener(object : MouseAdapter() {
-                override fun mouseExited(event: MouseEvent) { crosshair = null; repaint() }
+                override fun mouseExited(event: MouseEvent) { crosshair = null; dragAnchorX = null; cursor = Cursor.getDefaultCursor(); repaint() }
+                override fun mousePressed(event: MouseEvent) {
+                    if (event.button == MouseEvent.BUTTON1) {
+                        dragAnchorX = event.x; dragAnchorOffset = historyOffset
+                        cursor = Cursor.getPredefinedCursor(Cursor.MOVE_CURSOR)
+                    }
+                }
+                override fun mouseReleased(event: MouseEvent) { dragAnchorX = null; cursor = Cursor.getDefaultCursor() }
             })
+            addMouseWheelListener { event ->
+                visibleCount = (visibleCount + event.wheelRotation * 10).coerceIn(20, 240)
+                historyOffset = historyOffset.coerceAtMost((lastDataSize - visibleCount.coerceAtMost(lastDataSize)).coerceAtLeast(0))
+                repaint()
+            }
         }
     }
+    fun resetViewport() { visibleCount = 90; historyOffset = 0; crosshair = null; repaint() }
+    internal fun viewportState() = visibleCount to historyOffset
     override fun contains(x: Int, y: Int) = !watermark && super.contains(x, y)
     override fun getToolTipText(event: MouseEvent): String? {
         val plotWidth = (width - 108).coerceAtLeast(1)
@@ -156,7 +185,14 @@ class CryptoChartCanvas(private val watermark: Boolean = false) : JComponent() {
                 g.drawString("${s.selected} · ${service.chartError ?: if (s.enabled) "正在加载 K线…" else "行情已停用"}", 12, 24)
                 return
             }
-            val bars = data.bars.takeLast(90); visibleBars = bars
+            val key = "${data.symbol}:${data.period}"
+            if (key != lastDataKey) { lastDataKey = key; resetViewport() }
+            else if (historyOffset > 0 && data.bars.size > lastDataSize) historyOffset += data.bars.size - lastDataSize
+            lastDataSize = data.bars.size
+            val count = visibleCount.coerceIn(1, minOf(240, data.bars.size))
+            val offset = historyOffset.coerceIn(0, (data.bars.size - count).coerceAtLeast(0))
+            val endIndex = data.bars.size - offset
+            val bars = data.bars.subList((endIndex - count).coerceAtLeast(0), endIndex); visibleBars = bars
             val plotWidth = (width - 108).coerceAtLeast(1)
             val top = 52
             val plotHeight = ((height - 90) * 0.76).toInt().coerceAtLeast(1)
@@ -178,6 +214,7 @@ class CryptoChartCanvas(private val watermark: Boolean = false) : JComponent() {
             }
             val maxVolume = bars.maxOf { it.volume }.coerceAtLeast(1e-12)
             val stride = plotWidth.toDouble() / bars.size
+            lastStride = stride
             val bodyWidth = (stride * 0.65).toInt().coerceAtLeast(1)
             bars.forEachIndexed { index, bar ->
                 val x = 12 + ((index + 0.5) * stride).toInt()

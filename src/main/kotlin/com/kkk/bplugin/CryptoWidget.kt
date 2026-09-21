@@ -35,7 +35,7 @@ class CryptoWidget(private val project: Project) : CustomStatusBarWidget {
     private fun render() {
         val s = CryptoSettings.getInstance().state
         val service = CryptoMarketService.getInstance()
-        val next = "${s.statusSymbols}|${s.enabled}|${s.statusStyle}|${s.decimals}|${s.color}|${service.quotes}|${service.status()}"
+        val next = "${s.statusSymbols}|${s.enabled}|${s.statusStyle}|${s.decimals}|${s.color}|${service.quotes}|${service.status()}|${service.activeAlerts}"
         if (next == signature) return
         signature = next; panel.removeAll()
         val symbols = s.statusSymbols.take(6).ifEmpty { listOf("") }
@@ -45,16 +45,17 @@ class CryptoWidget(private val project: Project) : CustomStatusBarWidget {
             val name = pair?.base ?: symbol
             val price = q?.let { marketPrice(it.price, s.decimals) } ?: "—"
             val change = q?.let { (if (it.change.signum() > 0) "+" else "") + marketPrice(it.change, 2) + "%" } ?: "—"
+            val alert = service.activeAlerts.firstOrNull { it.symbol == symbol }
             val text = if (symbol.isEmpty()) "Crypto" else when (s.statusStyle) {
                 "仅价格" -> price
                 "名称 + 涨跌幅" -> "$name $change"
                 "完整" -> "$name $price $change"
                 else -> "$name $price"
             }
-            panel.add(JBLabel(text + if ((!s.enabled || service.error != null) && symbol.isNotEmpty()) " ·" else "").apply {
+            panel.add(JBLabel(text + if (alert != null) " !" else if ((!s.enabled || service.error != null) && symbol.isNotEmpty()) " ·" else "").apply {
                 border = JBUI.Borders.empty(0, 2); cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-                foreground = if (s.color && q != null) { if (q.change.signum() > 0) JBColor(0xD64242, 0xFF6B6B) else if (q.change.signum() < 0) JBColor(0x2A9955, 0x62C985) else JBColor.GRAY } else JBColor.GRAY
-                toolTipText = if (symbol.isEmpty()) "打开 Quiet Crypto" else "$pair · $price ${pair?.quote.orEmpty()} · 24h $change · 最高 ${q?.high ?: "—"} · 最低 ${q?.low ?: "—"} · ${service.status()}"
+                foreground = if (alert != null) JBColor(0xB5792A, 0xF2B84B) else if (s.color && q != null) { if (q.change.signum() > 0) JBColor(0xD64242, 0xFF6B6B) else if (q.change.signum() < 0) JBColor(0x2A9955, 0x62C985) else JBColor.GRAY } else JBColor.GRAY
+                toolTipText = if (symbol.isEmpty()) "打开 Quiet Crypto" else "$pair · $price ${pair?.quote.orEmpty()} · 24h $change · 最高 ${q?.high ?: "—"} · 最低 ${q?.low ?: "—"} · ${alert?.message ?: service.status()}"
                 addMouseListener(object : MouseAdapter() {
                     override fun mouseClicked(e: MouseEvent) {
                         if (e.button == MouseEvent.BUTTON1) {
@@ -66,6 +67,7 @@ class CryptoWidget(private val project: Project) : CustomStatusBarWidget {
                     private fun menu(e: MouseEvent) { if (e.isPopupTrigger) JPopupMenu().apply {
                         add(JMenuItem("打开行情列表").apply { addActionListener { CryptoPopup.show(project) } })
                         add(JMenuItem("刷新").apply { addActionListener { service.refresh() } })
+                        if (service.activeAlerts.isNotEmpty()) add(JMenuItem("清除提醒状态").apply { addActionListener { service.dismissAlerts(); render() } })
                         if (symbol.isNotEmpty()) add(JMenuItem("移除此状态栏条目").apply { addActionListener { s.statusSymbols.remove(symbol); render() } })
                     }.show(e.component, e.x, e.y) }
                 })

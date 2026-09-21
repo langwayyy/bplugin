@@ -46,4 +46,8 @@ class BinanceMarketClientTest {
         assertEquals(3510.0, update.candle?.bar?.close ?: 0.0, 0.0001)
         assertFalse(update.candle?.closed ?: true)
     }
+    @Test fun `all exposed chart periods map to supported Binance intervals`() {
+        assertEquals(listOf("1m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d", "1w"),
+            KlinePeriod.entries.map(KlinePeriod::binanceInterval))
+    }
 }

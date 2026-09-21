@@ -7,9 +7,13 @@ import com.intellij.openapi.ui.ComboBox
 import com.intellij.ui.components.*
 import com.intellij.util.ui.FormBuilder
 import javax.swing.*
+import java.awt.FlowLayout
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
 
 enum class KlinePeriod(val label: String) {
-    INTRADAY("1分"), MINUTE5("5分"), MINUTE15("15分"), HOUR("1时"), HOUR4("4时"), DAY("日"), WEEK("周");
+    INTRADAY("1分"), MINUTE5("5分"), MINUTE15("15分"), MINUTE30("30分"),
+    HOUR("1时"), HOUR2("2时"), HOUR4("4时"), HOUR6("6时"), HOUR12("12时"), DAY("日"), WEEK("周");
     override fun toString() = label
 }
 data class KlineBar(val timestamp: Long, val open: Double, val high: Double, val low: Double, val close: Double, val volume: Double)
@@ -34,6 +38,9 @@ class CryptoSettings : PersistentStateComponent<CryptoSettings.Options> {
         var opacity: Int = 12,
         var rotation: MutableList<String> = mutableListOf(),
         var autoRotate: Boolean = false,
+        var alertsEnabled: Boolean = true,
+        var alertCooldownMinutes: Int = 30,
+        var alertRulesJson: String = "[]",
     )
     private var options = Options()
     override fun getState() = options
@@ -42,6 +49,7 @@ class CryptoSettings : PersistentStateComponent<CryptoSettings.Options> {
             interval = interval.takeIf { it in listOf(0, 5, 10, 30) } ?: 10
             decimals = decimals.coerceIn(-1, 12)
             opacity = opacity.coerceIn(1, 50)
+            alertCooldownMinutes = alertCooldownMinutes.coerceIn(1, 1_440)
             selected = normalizeMarketSymbol(selected).takeIf(::isCryptoSymbol) ?: "BTCUSDT"
             period = period.takeIf { p -> KlinePeriod.entries.any { it.name == p } } ?: "HOUR"
             quote = quote.takeIf { it in listOf("USDT", "USDC", "BTC", "ETH") } ?: "USDT"
@@ -52,6 +60,16 @@ class CryptoSettings : PersistentStateComponent<CryptoSettings.Options> {
         }
     }
     fun period() = KlinePeriod.entries.firstOrNull { it.name == options.period } ?: KlinePeriod.HOUR
+    fun alertRules(): List<CryptoAlertRule> = runCatching {
+        Gson().fromJson<List<CryptoAlertRule>>(options.alertRulesJson, object : TypeToken<List<CryptoAlertRule>>() {}.type)
+    }.getOrDefault(emptyList()).filter { rule ->
+        isCryptoSymbol(rule.symbol) && when (rule.condition) {
+            AlertCondition.PRICE_ABOVE, AlertCondition.PRICE_BELOW -> rule.threshold.signum() > 0
+            AlertCondition.CHANGE_ABOVE -> rule.threshold.signum() >= 0
+            AlertCondition.CHANGE_BELOW -> rule.threshold.signum() <= 0
+        }
+    }.take(100)
+    fun saveAlertRules(rules: List<CryptoAlertRule>) { options.alertRulesJson = Gson().toJson(rules.distinctBy(CryptoAlertRule::id).take(100)) }
     companion object { fun getInstance() = ApplicationManager.getApplication().getService(CryptoSettings::class.java) }
 }
 
@@ -67,6 +85,9 @@ class CryptoConfigurable : Configurable {
     private val background = JBCheckBox("启用编辑器 K线背景")
     private val opacity = JSpinner(SpinnerNumberModel(12, 1, 50, 1))
     private val rotate = JBCheckBox("每30秒轮播本地轮播列表")
+    private val alerts = JBCheckBox("启用本地静默提醒（状态栏与行情页）")
+    private val alertCooldown = JSpinner(SpinnerNumberModel(30, 1, 1_440, 5))
+    private val alertCount = JBLabel()
     private val connection = JBLabel("公共行情无需账号、API Key 或 Cookie")
     private val test = JButton("测试连接").apply { addActionListener {
         isEnabled = false
@@ -87,14 +108,21 @@ class CryptoConfigurable : Configurable {
             .addComponent(pause).addLabeledComponent("价格小数位（-1 自动）", decimals)
             .addSeparator().addLabeledComponent("状态栏显示", style).addComponent(color)
             .addSeparator().addComponent(background).addLabeledComponent("背景不透明度 %", opacity)
-            .addComponent(rotate).addSeparator().addComponent(test).addComponent(connection)
+            .addComponent(rotate).addSeparator().addComponent(alerts)
+            .addLabeledComponent("提醒冷却时间（分钟）", alertCooldown)
+            .addComponent(JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply {
+                add(alertCount); add(JButton("清空提醒").apply { addActionListener {
+                    CryptoSettings.getInstance().saveAlertRules(emptyList()); updateAlertCount()
+                } })
+            }).addSeparator().addComponent(test).addComponent(connection)
             .addComponentFillVertically(JPanel(), 0).panel
     }
     private fun value() = CryptoSettings.getInstance().state.copy(
         enabled = enabled.isSelected, realtime = realtime.isSelected, interval = listOf(0, 5, 10, 30)[interval.selectedIndex],
         quote = quote.selectedItem as String, pauseInactive = pause.isSelected,
         decimals = decimals.value as Int, statusStyle = style.selectedItem as String,
-        color = color.isSelected, background = background.isSelected, opacity = opacity.value as Int, autoRotate = rotate.isSelected)
+        color = color.isSelected, background = background.isSelected, opacity = opacity.value as Int, autoRotate = rotate.isSelected,
+        alertsEnabled = alerts.isSelected, alertCooldownMinutes = alertCooldown.value as Int)
     override fun isModified() = value() != CryptoSettings.getInstance().state
     override fun apply() {
         CryptoSettings.getInstance().loadState(value())
@@ -107,5 +135,7 @@ class CryptoConfigurable : Configurable {
         interval.selectedIndex = listOf(0, 5, 10, 30).indexOf(s.interval).coerceAtLeast(0)
         quote.selectedItem = s.quote; decimals.value = s.decimals; style.selectedItem = s.statusStyle
         color.isSelected = s.color; background.isSelected = s.background; opacity.value = s.opacity; rotate.isSelected = s.autoRotate
+        alerts.isSelected = s.alertsEnabled; alertCooldown.value = s.alertCooldownMinutes; updateAlertCount()
     }
+    private fun updateAlertCount() { alertCount.text = "已配置 ${CryptoSettings.getInstance().alertRules().size} 条提醒  " }
 }

@@ -19,6 +19,7 @@ class CryptoMarketService : Disposable {
     @Volatile var chartError: String? = null; private set
     @Volatile var streamConnected = false; private set
     @Volatile var streamMessage: String? = null; private set
+    @Volatile var activeAlerts: List<CryptoAlertEvent> = emptyList(); private set
     private val busy = AtomicBoolean()
     private val chartBusy = AtomicBoolean()
     private var nextRefresh = 0L
@@ -28,6 +29,7 @@ class CryptoMarketService : Disposable {
     private var catalogUpdated = Instant.EPOCH
     private var streamFailures = 0
     private var streamRetryAt = Instant.EPOCH
+    private val alertEngine = CryptoAlertEngine()
     @Volatile private var disposed = false
     private val stream = BinanceStreamClient(
         onUpdate = { update -> ApplicationManager.getApplication().invokeLater { applyStreamUpdate(update) } },
@@ -40,6 +42,7 @@ class CryptoMarketService : Disposable {
             if (!s.enabled) { stopRealtime(null); return@invokeLater }
             if (s.pauseInactive && !ApplicationManager.getApplication().isActive) { stopRealtime("后台刷新已暂停"); return@invokeLater }
             val now = System.currentTimeMillis()
+            activeAlerts = activeAlerts.filter { Duration.between(it.triggeredAt, Instant.now()).toMinutes() < 60 }
             if (s.autoRotate && s.rotation.isNotEmpty() && now >= nextRotation) {
                 s.selected = s.rotation[(s.rotation.indexOf(s.selected) + 1).mod(s.rotation.size)]
                 nextRotation = now + 30_000
@@ -70,7 +73,13 @@ class CryptoMarketService : Disposable {
             ApplicationManager.getApplication().invokeLater {
                 if (!disposed && CryptoSettings.getInstance().state.enabled) result.onSuccess { (catalog, data, missing) ->
                     if (pairs !== catalog) catalogUpdated = Instant.now()
-                    pairs = catalog; quotes = data.associateBy { it.symbol }; updated = Instant.now()
+                    data.forEach(::evaluateAlerts)
+                    pairs = catalog
+                    val merged = quotes.toMutableMap()
+                    data.forEach { quote ->
+                        if (merged[quote.symbol]?.updatedAt?.isAfter(quote.updatedAt) != true) merged[quote.symbol] = quote
+                    }
+                    quotes = merged; updated = Instant.now()
                     error = missing.takeIf { it.isNotEmpty() }?.let { "交易对不可用：${it.joinToString()}" }; failures = 0
                 }.onFailure {
                     error = it.message ?: "币安行情连接失败"
@@ -134,6 +143,7 @@ class CryptoMarketService : Disposable {
     private fun applyStreamUpdate(update: StreamUpdate) {
         if (disposed || !CryptoSettings.getInstance().state.enabled) return
         update.quote?.let { quote ->
+            evaluateAlerts(quote)
             quotes = quotes.toMutableMap().apply { put(quote.symbol, quote) }
             updated = quote.updatedAt; error = null
         }
@@ -148,6 +158,13 @@ class CryptoMarketService : Disposable {
             }
         }
     }
+    private fun evaluateAlerts(quote: CryptoQuote) {
+        val settings = CryptoSettings.getInstance()
+        val rules = if (settings.state.alertsEnabled) settings.alertRules() else emptyList()
+        val events = alertEngine.evaluate(quote, rules, settings.state.alertCooldownMinutes)
+        if (events.isNotEmpty()) activeAlerts = (events + activeAlerts).distinctBy(CryptoAlertEvent::ruleId).take(10)
+    }
+    fun dismissAlerts() { activeAlerts = emptyList() }
     fun status(): String {
         val s = CryptoSettings.getInstance().state
         if (!s.enabled) return "币安行情已停用，可在设置中启用"
