@@ -4,6 +4,7 @@ import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import com.intellij.util.net.HttpConfigurable
 import java.math.BigDecimal
+import java.math.RoundingMode
 import java.net.HttpURLConnection
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
@@ -36,6 +37,11 @@ data class TestnetSymbolRules(
     val maxPrice: BigDecimal = BigDecimal.ZERO,
     val tickSize: BigDecimal = BigDecimal.ZERO,
 ) {
+    fun normalizeQuantity(value: BigDecimal): BigDecimal = normalizeStep(value, stepSize).let {
+        if (maxQuantity.signum() > 0) minOf(it, maxQuantity) else it
+    }
+    fun normalizePrice(value: BigDecimal): BigDecimal = normalizeStep(value, tickSize)
+
     fun validate(quantity: BigDecimal, price: BigDecimal?, validatePriceStep: Boolean = true): String? {
         if (quantity < minQuantity) return "数量不能小于 ${marketPrice(minQuantity)}"
         if (maxQuantity.signum() > 0 && quantity > maxQuantity) return "数量不能大于 ${marketPrice(maxQuantity)}"
@@ -49,6 +55,10 @@ data class TestnetSymbolRules(
             return "订单金额不能小于 ${marketPrice(minNotional)} USDT"
         return null
     }
+
+    private fun normalizeStep(value: BigDecimal, step: BigDecimal): BigDecimal =
+        if (step.signum() <= 0) value.stripTrailingZeros()
+        else value.divide(step, 0, RoundingMode.DOWN).multiply(step).stripTrailingZeros()
 }
 
 class BinanceTestnetException(val code: Int?, message: String) : Exception(message)
@@ -90,6 +100,9 @@ class BinanceTestnetClient {
 
     fun cancelOrder(symbol: String, orderId: Long, apiKey: String, secret: String): TestnetOrder = parseOrder(
         signed("DELETE", "/api/v3/order", mapOf("symbol" to normalizeMarketSymbol(symbol), "orderId" to orderId.toString()), apiKey, secret).asJsonObject)
+
+    fun cancelOpenOrders(symbol: String, apiKey: String, secret: String): List<TestnetOrder> = parseOrders(
+        signed("DELETE", "/api/v3/openOrders", mapOf("symbol" to normalizeMarketSymbol(symbol)), apiKey, secret).asJsonArray)
 
     fun tickerPrice(symbol: String): BigDecimal = JsonParser.parseString(request("GET", "/api/v3/ticker/price",
         mapOf("symbol" to normalizeMarketSymbol(symbol)))).asJsonObject.decimal("price")

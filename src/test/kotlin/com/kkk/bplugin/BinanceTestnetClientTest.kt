@@ -18,4 +18,12 @@ class BinanceTestnetClientTest : TestCase() {
         assertNotNull(rules.validate(BigDecimal("0.002"), BigDecimal("50000.005")))
         assertNull(rules.validate(BigDecimal("0.002"), BigDecimal("50000")))
     }
+
+    fun testSymbolRulesNormalizeQuantityAndPriceDownToExchangeSteps() {
+        val rules = TestnetSymbolRules(BigDecimal("0.001"), BigDecimal("2"), BigDecimal("0.001"), BigDecimal("10"),
+            BigDecimal("0.01"), BigDecimal("1000000"), BigDecimal("0.01"))
+        assertEquals(BigDecimal("0.123"), rules.normalizeQuantity(BigDecimal("0.123987")))
+        assertEquals(BigDecimal("2"), rules.normalizeQuantity(BigDecimal("3.5")))
+        assertEquals(BigDecimal("64250.12"), rules.normalizePrice(BigDecimal("64250.129")))
+    }
 }

@@ -18,6 +18,7 @@ import java.net.http.WebSocket
 import java.nio.ByteBuffer
 import java.time.Duration
 import java.time.Instant
+import java.math.BigDecimal
 import java.util.concurrent.CompletionStage
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -34,6 +35,14 @@ data class TestnetSnapshot(
     val history: List<TestnetOrder> = emptyList(),
     val updatedAt: Instant? = null,
 )
+
+data class TestnetOrderDraft(
+    val quantity: BigDecimal,
+    val price: BigDecimal?,
+    val referencePrice: BigDecimal,
+) {
+    val notional: BigDecimal get() = quantity * referencePrice
+}
 
 object BinanceTestnetCredentials {
     private val attributes = CredentialAttributes("QuietCrypto.BinanceSpotTestnet.Secret")
@@ -134,6 +143,42 @@ class CryptoTestnetTradingService : Disposable {
             val result = runCatching { client.cancelOrder(order.symbol, order.id, credentials.first, credentials.second) }
             busy.set(false)
             result.onSuccess { refresh(order.symbol) }.onFailure { error = it.message }
+            ApplicationManager.getApplication().invokeLater { callback(result) }
+        }
+    }
+
+    fun prepareOrder(symbol: String, side: PaperOrderSide, type: PaperOrderType, quantity: BigDecimal?,
+                     price: BigDecimal?, fraction: BigDecimal? = null, callback: (Result<TestnetOrderDraft>) -> Unit) {
+        if (!busy.compareAndSet(false, true)) return callback(Result.failure(IllegalStateException("测试网请求正在处理中")))
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val result = runCatching {
+                val normalized = normalizeMarketSymbol(symbol)
+                val rules = client.rules(normalized, type)
+                val reference = if (type == PaperOrderType.LIMIT && price != null && price.signum() > 0)
+                    rules.normalizePrice(price) else client.tickerPrice(normalized)
+                val rawQuantity = if (fraction != null) {
+                    val free = if (side == PaperOrderSide.BUY) snapshot.balances.firstOrNull { it.asset == "USDT" }?.free
+                    else snapshot.balances.firstOrNull { it.asset == normalized.removeSuffix("USDT") }?.free
+                    require(free != null && free.signum() > 0) { if (side == PaperOrderSide.BUY) "USDT 可用余额不足" else "可卖资产余额不足" }
+                    if (side == PaperOrderSide.BUY) free.multiply(fraction).divide(reference, 16, java.math.RoundingMode.DOWN)
+                    else free * fraction
+                } else requireNotNull(quantity) { "请输入数量" }
+                val normalizedQuantity = rules.normalizeQuantity(rawQuantity)
+                rules.validate(normalizedQuantity, reference, type == PaperOrderType.LIMIT)?.let { error(it) }
+                TestnetOrderDraft(normalizedQuantity, if (type == PaperOrderType.LIMIT) reference else null, reference)
+            }
+            busy.set(false)
+            ApplicationManager.getApplication().invokeLater { callback(result) }
+        }
+    }
+
+    fun cancelAll(symbol: String, callback: (Result<List<TestnetOrder>>) -> Unit) {
+        val credentials = credentials() ?: return callback(Result.failure(IllegalStateException("请先配置测试网凭据")))
+        if (!busy.compareAndSet(false, true)) return callback(Result.failure(IllegalStateException("测试网请求正在处理中")))
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val result = runCatching { client.cancelOpenOrders(symbol, credentials.first, credentials.second) }
+            busy.set(false)
+            result.onSuccess { refresh(symbol) }.onFailure { error = it.message }
             ApplicationManager.getApplication().invokeLater { callback(result) }
         }
     }

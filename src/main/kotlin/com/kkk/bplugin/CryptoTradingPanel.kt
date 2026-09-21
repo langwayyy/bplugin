@@ -17,6 +17,8 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import javax.swing.*
+import javax.swing.event.DocumentEvent
+import javax.swing.event.DocumentListener
 import javax.swing.table.AbstractTableModel
 
 class CryptoTradingPanel(project: Project?, initialSymbol: String?, initialSide: PaperOrderSide) : JPanel(BorderLayout(0, JBUI.scale(6))) {
@@ -76,6 +78,9 @@ class CryptoTestnetPanel(private val project: Project?, initialSymbol: String?, 
     private val price = JBTextField().apply { columns = 12; emptyText.text = "限价"; isEnabled = false }
     private val submit = JButton("提交测试网订单")
     private val cancel = JButton("撤销所选委托")
+    private val cancelAll = JButton("撤销该交易对全部委托")
+    private val normalize = JButton("按规则取整")
+    private val estimate = JBLabel("预计金额：—")
     private val message = JBLabel("测试网使用虚拟资产，订单会发送至 Binance Spot Testnet")
     private var balances = emptyList<TestnetBalance>()
     private var openOrders = emptyList<TestnetOrder>()
@@ -111,24 +116,44 @@ class CryptoTestnetPanel(private val project: Project?, initialSymbol: String?, 
             add(JButton("同步账户").apply { addActionListener { service.refresh(selectedSymbol()); message.text = "正在同步测试网账户…" } }, BorderLayout.EAST)
         }, BorderLayout.NORTH)
         add(JPanel(BorderLayout(0, JBUI.scale(8))).apply {
-            add(JPanel(FlowLayout(FlowLayout.LEFT)).apply {
-                add(JBLabel("交易对")); add(symbol); add(side); add(type); add(JBLabel("数量")); add(quantity)
-                add(JBLabel("价格")); add(price); add(submit)
+            add(JPanel().apply {
+                layout = BoxLayout(this, BoxLayout.Y_AXIS)
+                add(JPanel(FlowLayout(FlowLayout.LEFT)).apply {
+                    add(JBLabel("交易对")); add(symbol); add(side); add(type); add(JBLabel("数量")); add(quantity)
+                    add(JBLabel("价格")); add(price); add(submit)
+                })
+                add(JPanel(FlowLayout(FlowLayout.LEFT)).apply {
+                    add(JBLabel("快捷仓位"))
+                    listOf(25, 50, 75, 100).forEach { percent ->
+                        add(JButton("$percent%").apply { addActionListener { sizeByPercent(percent) } })
+                    }
+                    add(normalize); add(Box.createHorizontalStrut(JBUI.scale(12))); add(estimate)
+                })
             }, BorderLayout.NORTH)
             add(JTabbedPane().apply {
                 addTab("测试网资产", scroll(table(balanceModel)))
                 addTab("当前委托", JPanel(BorderLayout()).apply {
                     add(scroll(orderTable), BorderLayout.CENTER)
-                    add(JPanel(FlowLayout(FlowLayout.RIGHT)).apply { add(cancel) }, BorderLayout.SOUTH)
+                    add(JPanel(FlowLayout(FlowLayout.RIGHT)).apply { add(cancelAll); add(cancel) }, BorderLayout.SOUTH)
                 })
                 addTab("订单记录", scroll(table(historyModel)))
             }, BorderLayout.CENTER)
             add(message, BorderLayout.SOUTH)
         }, BorderLayout.CENTER)
-        type.addActionListener { price.isEnabled = type.selectedItem == PaperOrderType.LIMIT }
+        type.addActionListener { price.isEnabled = type.selectedItem == PaperOrderType.LIMIT; updateEstimate() }
+        side.addActionListener { updateEstimate() }
         submit.addActionListener { submit() }
         cancel.addActionListener { cancelSelected() }
-        symbol.addActionListener { service.refresh(selectedSymbol()) }
+        cancelAll.addActionListener { cancelAll() }
+        normalize.addActionListener { prepareCurrent() }
+        symbol.addActionListener { service.refresh(selectedSymbol()); updateEstimate() }
+        val documentListener = object : DocumentListener {
+            override fun insertUpdate(e: DocumentEvent?) = updateEstimate()
+            override fun removeUpdate(e: DocumentEvent?) = updateEstimate()
+            override fun changedUpdate(e: DocumentEvent?) = updateEstimate()
+        }
+        quantity.document.addDocumentListener(documentListener)
+        price.document.addDocumentListener(documentListener)
         syncSymbols(initialSymbol)
         render()
     }
@@ -160,8 +185,52 @@ class CryptoTestnetPanel(private val project: Project?, initialSymbol: String?, 
         cancel.isEnabled = false
         service.cancel(order) { result -> cancel.isEnabled = true; message.text = result.fold({ "已撤销测试网委托 #${it.id}" }, { "撤单失败：${it.message}" }); fingerprint = "" }
     }
+    private fun cancelAll() {
+        val selected = selectedSymbol()
+        val count = openOrders.count { it.symbol == selected }
+        if (count == 0) { message.text = "$selected 暂无可撤委托"; return }
+        if (Messages.showYesNoDialog(project, "确认撤销 $selected 的全部 $count 条测试网委托？", "确认批量撤单", null) != Messages.YES) return
+        cancelAll.isEnabled = false; message.text = "正在撤销 $selected 的全部委托…"
+        service.cancelAll(selected) { result ->
+            cancelAll.isEnabled = true; fingerprint = ""
+            message.text = result.fold({ "已撤销 $selected 的 ${it.size} 条委托" }, { "批量撤单失败：${it.message}" })
+        }
+    }
+    private fun sizeByPercent(percent: Int) {
+        prepare(BigDecimal(percent).movePointLeft(2), null)
+    }
+    private fun prepareCurrent() {
+        val amount = quantity.text.trim().toBigDecimalOrNull()
+        if (amount == null || amount.signum() <= 0) { message.text = "请输入需要取整的数量"; return }
+        prepare(null, amount)
+    }
+    private fun prepare(fraction: BigDecimal?, amount: BigDecimal?) {
+        val orderType = type.selectedItem as PaperOrderType
+        val limit = price.text.trim().toBigDecimalOrNull()
+        normalize.isEnabled = false; message.text = if (fraction == null) "正在按测试网规则取整…" else "正在计算 ${fraction.movePointRight(2).toInt()}% 仓位…"
+        service.prepareOrder(selectedSymbol(), side.selectedItem as PaperOrderSide, orderType, amount, limit, fraction) { result ->
+            normalize.isEnabled = true
+            result.onSuccess { draft ->
+                quantity.text = draft.quantity.toPlainString()
+                if (draft.price != null) price.text = draft.price.toPlainString()
+                message.text = "已按测试网规则填写 · 预计 ${marketPrice(draft.notional, 2)} USDT"
+            }.onFailure { message.text = "计算失败：${it.message}" }
+        }
+    }
+    private fun updateEstimate() {
+        val amount = quantity.text.trim().toBigDecimalOrNull()
+        val selected = selectedSymbol()
+        val reference = if (type.selectedItem == PaperOrderType.LIMIT) price.text.trim().toBigDecimalOrNull()
+            else market.quotes[selected]?.price
+        val available = if (side.selectedItem == PaperOrderSide.BUY) balances.firstOrNull { it.asset == "USDT" }?.free
+        else balances.firstOrNull { it.asset == selected.removeSuffix("USDT") }?.free
+        val unit = if (side.selectedItem == PaperOrderSide.BUY) "USDT" else selected.removeSuffix("USDT")
+        estimate.text = "预计金额：${if (amount != null && reference != null) marketPrice(amount * reference, 2) + " USDT" else "—"}" +
+            " · 可用：${available?.let(::marketPrice) ?: "—"} $unit"
+    }
     private fun render() {
         syncSymbols(null)
+        updateEstimate()
         val snapshot = service.snapshot
         val next = "$snapshot|${service.error}|${service.streamConnected}"
         if (next == fingerprint) return
@@ -173,6 +242,7 @@ class CryptoTestnetPanel(private val project: Project?, initialSymbol: String?, 
         val usdt = balances.firstOrNull { it.asset == "USDT" }
         assetSummary.text = "测试网 USDT：${marketPrice(usdt?.free ?: BigDecimal.ZERO, 2)} 可用 · ${marketPrice(usdt?.locked ?: BigDecimal.ZERO, 2)} 冻结"
         updated.text = snapshot.updatedAt?.let { "更新：${TIME.format(it)}" } ?: "尚未同步"
+        updateEstimate()
         service.error?.let { message.text = "同步失败：$it" }
     }
     private fun syncSymbols(preferred: String?) {
