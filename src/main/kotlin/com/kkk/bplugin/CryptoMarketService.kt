@@ -159,6 +159,7 @@ class CryptoMarketService : Disposable {
         }
     }
     private fun evaluateAlerts(quote: CryptoQuote) {
+        CryptoPaperTradingService.getInstance().onQuote(quote)
         val settings = CryptoSettings.getInstance()
         val rules = if (settings.state.alertsEnabled) settings.alertRules() else emptyList()
         val events = alertEngine.evaluate(quote, rules, settings.state.alertCooldownMinutes)

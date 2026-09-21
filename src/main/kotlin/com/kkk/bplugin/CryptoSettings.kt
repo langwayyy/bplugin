@@ -42,6 +42,9 @@ class CryptoSettings : PersistentStateComponent<CryptoSettings.Options> {
         var alertCooldownMinutes: Int = 30,
         var alertRulesJson: String = "[]",
         var watchMetadataJson: String = "[]",
+        var paperInitialBalance: String = "10000",
+        var paperFeeBps: Int = 10,
+        var paperSlippageBps: Int = 2,
     )
     private var options = Options()
     override fun getState() = options
@@ -51,6 +54,9 @@ class CryptoSettings : PersistentStateComponent<CryptoSettings.Options> {
             decimals = decimals.coerceIn(-1, 12)
             opacity = opacity.coerceIn(1, 50)
             alertCooldownMinutes = alertCooldownMinutes.coerceIn(1, 1_440)
+            paperInitialBalance = paperInitialBalance.toBigDecimalOrNull()?.takeIf { it.signum() > 0 }?.stripTrailingZeros()?.toPlainString() ?: "10000"
+            paperFeeBps = paperFeeBps.coerceIn(0, 100)
+            paperSlippageBps = paperSlippageBps.coerceIn(0, 100)
             selected = normalizeMarketSymbol(selected).takeIf(::isCryptoSymbol) ?: "BTCUSDT"
             period = period.takeIf { p -> KlinePeriod.entries.any { it.name == p } } ?: "HOUR"
             quote = quote.takeIf { it in listOf("USDT", "USDC", "BTC", "ETH") } ?: "USDT"
@@ -122,6 +128,9 @@ class CryptoConfigurable : Configurable {
     private val alerts = JBCheckBox("启用本地静默提醒（状态栏与行情页）")
     private val alertCooldown = JSpinner(SpinnerNumberModel(30, 1, 1_440, 5))
     private val alertCount = JBLabel()
+    private val paperInitialBalance = JBTextField()
+    private val paperFeeBps = JSpinner(SpinnerNumberModel(10, 0, 100, 1))
+    private val paperSlippageBps = JSpinner(SpinnerNumberModel(2, 0, 100, 1))
     private val connection = JBLabel("公共行情无需账号、API Key 或 Cookie")
     private val test = JButton("测试连接").apply { addActionListener {
         isEnabled = false
@@ -149,6 +158,9 @@ class CryptoConfigurable : Configurable {
                     CryptoSettings.getInstance().saveAlertRules(emptyList()); updateAlertCount()
                 } })
             }).addSeparator().addComponent(test).addComponent(connection)
+            .addSeparator().addLabeledComponent("模拟盘初始 USDT", paperInitialBalance)
+            .addLabeledComponent("模拟手续费（基点，10 = 0.1%）", paperFeeBps)
+            .addLabeledComponent("市价滑点（基点）", paperSlippageBps)
             .addComponentFillVertically(JPanel(), 0).panel
     }
     private fun value() = CryptoSettings.getInstance().state.copy(
@@ -156,7 +168,9 @@ class CryptoConfigurable : Configurable {
         quote = quote.selectedItem as String, pauseInactive = pause.isSelected,
         decimals = decimals.value as Int, statusStyle = style.selectedItem as String,
         color = color.isSelected, background = background.isSelected, opacity = opacity.value as Int, autoRotate = rotate.isSelected,
-        alertsEnabled = alerts.isSelected, alertCooldownMinutes = alertCooldown.value as Int)
+        alertsEnabled = alerts.isSelected, alertCooldownMinutes = alertCooldown.value as Int,
+        paperInitialBalance = paperInitialBalance.text.trim(), paperFeeBps = paperFeeBps.value as Int,
+        paperSlippageBps = paperSlippageBps.value as Int)
     override fun isModified() = value() != CryptoSettings.getInstance().state
     override fun apply() {
         CryptoSettings.getInstance().loadState(value())
@@ -170,6 +184,7 @@ class CryptoConfigurable : Configurable {
         quote.selectedItem = s.quote; decimals.value = s.decimals; style.selectedItem = s.statusStyle
         color.isSelected = s.color; background.isSelected = s.background; opacity.value = s.opacity; rotate.isSelected = s.autoRotate
         alerts.isSelected = s.alertsEnabled; alertCooldown.value = s.alertCooldownMinutes; updateAlertCount()
+        paperInitialBalance.text = s.paperInitialBalance; paperFeeBps.value = s.paperFeeBps; paperSlippageBps.value = s.paperSlippageBps
     }
     private fun updateAlertCount() { alertCount.text = "已配置 ${CryptoSettings.getInstance().alertRules().size} 条提醒  " }
 }

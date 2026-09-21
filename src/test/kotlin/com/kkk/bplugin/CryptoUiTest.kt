@@ -87,8 +87,12 @@ class CryptoUiTest : BasePlatformTestCase() {
                 chart.dispatchEvent(java.awt.event.MouseEvent(chart, java.awt.event.MouseEvent.MOUSE_MOVED,
                     System.currentTimeMillis(), 0, 420, 210, 0, false))
                 render(chart, "chart-crosshair", 780, 430)
+                val paper = CryptoPaperTradingService.getInstance()
+                paper.reset()
+                paper.place("BTCUSDT", PaperOrderSide.BUY, PaperOrderType.MARKET, BigDecimal("0.05"), null, BigDecimal("64250.10"))
+                render(CryptoPaperPanel(project, "BTCUSDT", PaperOrderSide.BUY), "paper-trading", 1000, 620)
                 val configurable = CryptoConfigurable()
-                render(configurable.createComponent(), "settings", 720, 550)
+                render(configurable.createComponent(), "settings", 720, 700)
                 assertFalse(configurable.isModified)
                 val widget = CryptoWidget(project)
                 try { render(widget.component, "status", 420, 32) } finally { widget.dispose() }
