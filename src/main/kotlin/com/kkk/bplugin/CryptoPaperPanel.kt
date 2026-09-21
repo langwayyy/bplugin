@@ -21,8 +21,8 @@ import javax.swing.table.AbstractTableModel
 
 object CryptoPaperPopup {
     fun show(project: Project?, symbol: String? = null, side: PaperOrderSide = PaperOrderSide.BUY) {
-        JBPopupFactory.getInstance().createComponentPopupBuilder(CryptoPaperPanel(project, symbol, side), null)
-            .setTitle("Quiet Crypto · 本地模拟交易").setFocusable(true).setRequestFocus(true)
+        JBPopupFactory.getInstance().createComponentPopupBuilder(CryptoTradingPanel(project, symbol, side), null)
+            .setTitle("Quiet Crypto · 交易账户").setFocusable(true).setRequestFocus(true)
             .setResizable(true).setMovable(true).setDimensionServiceKey(project, "QuietCrypto.PaperTrading", true)
             .createPopup().showInFocusCenter()
     }
@@ -103,7 +103,7 @@ class CryptoPaperPanel(private val project: Project?, initialSymbol: String?, in
 
     init {
         border = JBUI.Borders.empty(12)
-        preferredSize = JBUI.size(1000, 620)
+        preferredSize = JBUI.size(1000, 600)
         add(JPanel(BorderLayout()).apply {
             add(JPanel(FlowLayout(FlowLayout.LEFT, 16, 0)).apply {
                 add(balance); add(equity); add(pnl)

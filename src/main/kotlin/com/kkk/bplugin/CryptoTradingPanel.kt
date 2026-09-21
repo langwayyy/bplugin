@@ -1,0 +1,199 @@
+package com.kkk.bplugin
+
+import com.intellij.openapi.options.ShowSettingsUtil
+import com.intellij.openapi.project.Project
+import com.intellij.openapi.ui.ComboBox
+import com.intellij.openapi.ui.Messages
+import com.intellij.ui.components.JBLabel
+import com.intellij.ui.components.JBScrollPane
+import com.intellij.ui.components.JBTextField
+import com.intellij.ui.table.JBTable
+import com.intellij.util.ui.JBUI
+import java.awt.BorderLayout
+import java.awt.CardLayout
+import java.awt.FlowLayout
+import java.math.BigDecimal
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import javax.swing.*
+import javax.swing.table.AbstractTableModel
+
+class CryptoTradingPanel(project: Project?, initialSymbol: String?, initialSide: PaperOrderSide) : JPanel(BorderLayout(0, JBUI.scale(6))) {
+    private val settings = CryptoSettings.getInstance()
+    private val testnet = CryptoTestnetTradingService.getInstance()
+    private val mode = ComboBox(TradingAccountMode.entries.toTypedArray())
+    private val state = JBLabel()
+    private val cards = JPanel(CardLayout())
+    private val timer = Timer(1_000) { updateState() }
+
+    init {
+        preferredSize = JBUI.size(1040, 680)
+        border = JBUI.Borders.empty(8)
+        mode.selectedItem = TradingAccountMode.entries.firstOrNull { it.name == settings.state.tradingMode } ?: TradingAccountMode.LOCAL
+        add(JPanel(BorderLayout()).apply {
+            add(JPanel(FlowLayout(FlowLayout.LEFT)).apply { add(JBLabel("账户")); add(mode); add(state) }, BorderLayout.WEST)
+            add(JButton("账户设置").apply { addActionListener { ShowSettingsUtil.getInstance().showSettingsDialog(project, CryptoConfigurable::class.java) } }, BorderLayout.EAST)
+        }, BorderLayout.NORTH)
+        cards.add(CryptoPaperPanel(project, initialSymbol, initialSide), TradingAccountMode.LOCAL.name)
+        cards.add(CryptoTestnetPanel(project, initialSymbol, initialSide), TradingAccountMode.TESTNET.name)
+        add(cards, BorderLayout.CENTER)
+        mode.addActionListener {
+            val selected = mode.selectedItem as TradingAccountMode
+            settings.state.tradingMode = selected.name
+            (cards.layout as CardLayout).show(cards, selected.name)
+            testnet.accountModeChanged(selected)
+            if (selected == TradingAccountMode.TESTNET) testnet.refresh(initialSymbol)
+            updateState()
+        }
+        (cards.layout as CardLayout).show(cards, (mode.selectedItem as TradingAccountMode).name)
+        if (mode.selectedItem == TradingAccountMode.TESTNET) testnet.refresh(initialSymbol)
+        updateState()
+    }
+    override fun addNotify() { super.addNotify(); timer.start() }
+    override fun removeNotify() { timer.stop(); super.removeNotify() }
+    private fun updateState() {
+        state.text = when (mode.selectedItem as TradingAccountMode) {
+            TradingAccountMode.LOCAL -> "● 本地数据 · 不发送订单"
+            TradingAccountMode.TESTNET -> when {
+                !testnet.hasCredentials() -> "○ 未配置测试网凭据"
+                testnet.streamConnected -> "● 测试网已连接 · 用户数据实时同步"
+                else -> "◐ ${testnet.streamMessage ?: testnet.error ?: "测试网 REST 同步"}"
+            }
+        }
+    }
+}
+
+class CryptoTestnetPanel(private val project: Project?, initialSymbol: String?, initialSide: PaperOrderSide) : JPanel(BorderLayout(0, JBUI.scale(8))) {
+    private val service = CryptoTestnetTradingService.getInstance()
+    private val market = CryptoMarketService.getInstance()
+    private val assetSummary = JBLabel()
+    private val updated = JBLabel()
+    private val symbol = ComboBox<String>().apply { isEditable = true; preferredSize = JBUI.size(150, 28) }
+    private val side = ComboBox(PaperOrderSide.entries.toTypedArray()).apply { selectedItem = initialSide }
+    private val type = ComboBox(PaperOrderType.entries.toTypedArray())
+    private val quantity = JBTextField().apply { columns = 10; emptyText.text = "数量" }
+    private val price = JBTextField().apply { columns = 12; emptyText.text = "限价"; isEnabled = false }
+    private val submit = JButton("提交测试网订单")
+    private val cancel = JButton("撤销所选委托")
+    private val message = JBLabel("测试网使用虚拟资产，订单会发送至 Binance Spot Testnet")
+    private var balances = emptyList<TestnetBalance>()
+    private var openOrders = emptyList<TestnetOrder>()
+    private var history = emptyList<TestnetOrder>()
+    private var fingerprint = ""
+    private val balanceModel = object : AbstractTableModel() {
+        override fun getRowCount() = balances.size
+        override fun getColumnCount() = 4
+        override fun getColumnName(column: Int) = arrayOf("资产", "可用", "冻结", "合计")[column]
+        override fun getValueAt(row: Int, column: Int): Any = balances[row].let {
+            when (column) { 0 -> it.asset; 1 -> marketPrice(it.free); 2 -> marketPrice(it.locked); else -> marketPrice(it.total) }
+        }
+    }
+    private val orderModel = object : AbstractTableModel() {
+        override fun getRowCount() = openOrders.size
+        override fun getColumnCount() = 8
+        override fun getColumnName(column: Int) = arrayOf("时间", "交易对", "方向", "类型", "数量", "已成交", "价格", "状态")[column]
+        override fun getValueAt(row: Int, column: Int): Any = orderCell(openOrders[row], column)
+    }
+    private val historyModel = object : AbstractTableModel() {
+        override fun getRowCount() = history.size
+        override fun getColumnCount() = 8
+        override fun getColumnName(column: Int) = arrayOf("时间", "交易对", "方向", "类型", "数量", "已成交", "成交均价", "状态")[column]
+        override fun getValueAt(row: Int, column: Int): Any = orderCell(history[row], column)
+    }
+    private val orderTable = table(orderModel)
+    private val timer = Timer(1_000) { render() }
+
+    init {
+        border = JBUI.Borders.empty(4)
+        add(JPanel(BorderLayout()).apply {
+            add(JPanel(FlowLayout(FlowLayout.LEFT, 16, 0)).apply { add(assetSummary); add(updated) }, BorderLayout.WEST)
+            add(JButton("同步账户").apply { addActionListener { service.refresh(selectedSymbol()); message.text = "正在同步测试网账户…" } }, BorderLayout.EAST)
+        }, BorderLayout.NORTH)
+        add(JPanel(BorderLayout(0, JBUI.scale(8))).apply {
+            add(JPanel(FlowLayout(FlowLayout.LEFT)).apply {
+                add(JBLabel("交易对")); add(symbol); add(side); add(type); add(JBLabel("数量")); add(quantity)
+                add(JBLabel("价格")); add(price); add(submit)
+            }, BorderLayout.NORTH)
+            add(JTabbedPane().apply {
+                addTab("测试网资产", scroll(table(balanceModel)))
+                addTab("当前委托", JPanel(BorderLayout()).apply {
+                    add(scroll(orderTable), BorderLayout.CENTER)
+                    add(JPanel(FlowLayout(FlowLayout.RIGHT)).apply { add(cancel) }, BorderLayout.SOUTH)
+                })
+                addTab("订单记录", scroll(table(historyModel)))
+            }, BorderLayout.CENTER)
+            add(message, BorderLayout.SOUTH)
+        }, BorderLayout.CENTER)
+        type.addActionListener { price.isEnabled = type.selectedItem == PaperOrderType.LIMIT }
+        submit.addActionListener { submit() }
+        cancel.addActionListener { cancelSelected() }
+        symbol.addActionListener { service.refresh(selectedSymbol()) }
+        syncSymbols(initialSymbol)
+        render()
+    }
+    override fun addNotify() { super.addNotify(); timer.start() }
+    override fun removeNotify() { timer.stop(); super.removeNotify() }
+
+    private fun submit() {
+        val amount = quantity.text.trim().toBigDecimalOrNull()
+        val orderType = type.selectedItem as PaperOrderType
+        val limit = price.text.trim().toBigDecimalOrNull()
+        if (amount == null || amount.signum() <= 0) { message.text = "请输入有效数量"; return }
+        if (orderType == PaperOrderType.LIMIT && (limit == null || limit.signum() <= 0)) { message.text = "请输入有效限价"; return }
+        val selected = selectedSymbol()
+        val sideValue = side.selectedItem as PaperOrderSide
+        val detail = "$selected · ${sideValue.label} · ${orderType.label} · 数量 ${marketPrice(amount)}" +
+            (limit?.let { " · 价格 ${marketPrice(it)}" } ?: "")
+        if (Messages.showYesNoDialog(project, "确认向 Binance Spot Testnet 提交：\n$detail", "确认测试网订单", null) != Messages.YES) return
+        submit.isEnabled = false; message.text = "正在提交测试网订单…"
+        service.place(selected, sideValue, orderType, amount, limit) { result ->
+            submit.isEnabled = true
+            message.text = result.fold({ "测试网订单已接受：#${it.id} · ${statusLabel(it.status)}" }, { "提交失败：${it.message}" })
+            if (result.isSuccess) { quantity.text = ""; fingerprint = "" }
+        }
+    }
+    private fun cancelSelected() {
+        val view = orderTable.selectedRow
+        val order = openOrders.getOrNull(view.takeIf { it >= 0 }?.let(orderTable::convertRowIndexToModel) ?: -1)
+            ?: run { message.text = "请先选择一条当前委托"; return }
+        cancel.isEnabled = false
+        service.cancel(order) { result -> cancel.isEnabled = true; message.text = result.fold({ "已撤销测试网委托 #${it.id}" }, { "撤单失败：${it.message}" }); fingerprint = "" }
+    }
+    private fun render() {
+        syncSymbols(null)
+        val snapshot = service.snapshot
+        val next = "$snapshot|${service.error}|${service.streamConnected}"
+        if (next == fingerprint) return
+        fingerprint = next
+        balances = snapshot.balances.sortedWith(compareByDescending<TestnetBalance> { it.asset == "USDT" }.thenBy(TestnetBalance::asset))
+        openOrders = snapshot.openOrders
+        history = snapshot.history
+        balanceModel.fireTableDataChanged(); orderModel.fireTableDataChanged(); historyModel.fireTableDataChanged()
+        val usdt = balances.firstOrNull { it.asset == "USDT" }
+        assetSummary.text = "测试网 USDT：${marketPrice(usdt?.free ?: BigDecimal.ZERO, 2)} 可用 · ${marketPrice(usdt?.locked ?: BigDecimal.ZERO, 2)} 冻结"
+        updated.text = snapshot.updatedAt?.let { "更新：${TIME.format(it)}" } ?: "尚未同步"
+        service.error?.let { message.text = "同步失败：$it" }
+    }
+    private fun syncSymbols(preferred: String?) {
+        val current = preferred ?: symbol.editor.item?.toString()
+        val symbols = (CryptoSettings.getInstance().state.watchlist + market.pairs.filter { it.quote == "USDT" }.take(100).map(CryptoPair::symbol))
+            .filter { it.endsWith("USDT") }.distinct()
+        if ((0 until symbol.itemCount).map(symbol::getItemAt) != symbols) symbol.model = DefaultComboBoxModel(symbols.toTypedArray())
+        symbol.selectedItem = normalizeMarketSymbol(current.orEmpty()).takeIf { it in symbols } ?: symbols.firstOrNull() ?: "BTCUSDT"
+    }
+    private fun selectedSymbol() = normalizeMarketSymbol(symbol.editor.item?.toString().orEmpty())
+    private fun orderCell(order: TestnetOrder, column: Int): Any = when (column) {
+        0 -> TIME.format(Instant.ofEpochMilli(order.time)); 1 -> order.symbol; 2 -> order.side.label; 3 -> order.type.label
+        4 -> marketPrice(order.quantity); 5 -> marketPrice(order.executedQuantity)
+        6 -> order.averagePrice?.let(::marketPrice) ?: order.price.takeIf { it.signum() > 0 }?.let(::marketPrice) ?: "—"
+        else -> statusLabel(order.status)
+    }
+    private fun table(model: AbstractTableModel) = JBTable(model).apply { rowHeight = JBUI.scale(28); setShowGrid(false); autoCreateRowSorter = true; emptyText.text = "暂无数据" }
+    private fun scroll(table: JBTable) = JBScrollPane(table).apply { setColumnHeaderView(table.tableHeader) }
+    private fun statusLabel(status: String) = when (status) {
+        "NEW" -> "挂单中"; "PARTIALLY_FILLED" -> "部分成交"; "FILLED" -> "已成交"; "CANCELED" -> "已撤销"
+        "REJECTED" -> "已拒绝"; "EXPIRED" -> "已过期"; else -> status
+    }
+    companion object { private val TIME = DateTimeFormatter.ofPattern("MM-dd HH:mm:ss").withZone(ZoneId.systemDefault()) }
+}

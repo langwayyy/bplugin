@@ -2,7 +2,7 @@
     <id>com.kkk.bplugin</id>
     <name>Quiet Crypto</name>
     <vendor>Bplugin</vendor>
-    <description><![CDATA[Low-distraction Binance spot watchlists, candlestick charts, alerts and local paper trading.]]></description>
+    <description><![CDATA[Low-distraction Binance spot watchlists, charts, alerts, local paper trading and optional Spot Testnet trading.]]></description>
     <depends>com.intellij.modules.platform</depends>
     <extensions defaultExtensionNs="com.intellij">
         <statusBarWidgetFactory id="com.kkk.bplugin.ticker" implementation="com.kkk.bplugin.CryptoWidgetFactory"/>

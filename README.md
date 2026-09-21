@@ -9,6 +9,7 @@
 - 本地自选列表：最新价、滚动 24h 涨跌幅、报价币成交额；点击表头排序，上下移动恢复手动顺序。
 - 自选支持本地分组、分组筛选和备注；可以用制表符或逗号分隔文本从剪贴板批量导入，并将完整名单复制导出。
 - 内置本地模拟交易账户：支持 USDT 现货市价单、限价单、撤单、持仓成本、手续费、滑点及实时盈亏；模拟订单不会发送到币安。
+- 可选连接 Binance Spot Testnet：安全保存测试网凭据、同步虚拟资产、提交和撤销测试网订单，并通过签名用户数据流实时校准账户状态。
 - 右键交易对：显示在状态栏、打开 K线浮窗、设为编辑器背景、加入轮播、移除自选。
 - 状态栏最多六个交易对，支持仅价格、名称与价格、名称与涨跌幅、完整信息；点击打开 K线，右键打开列表。
 - 固定、可拖动和缩放的 K线浮窗；1分、5分、15分、1时、4时、日、周周期，MA5/MA10/MA20、成交量、鼠标十字线及 OHLC 详情。
@@ -21,7 +22,7 @@
 
 ## 使用
 
-在 IDEA 的 `Settings → Plugins → 齿轮 → Install Plugin from Disk` 中选择 `build/distributions/bplugin-1.4.0.888888-SNAPSHOT.zip`，按 IDE 提示重启。
+在 IDEA 的 `Settings → Plugins → 齿轮 → Install Plugin from Disk` 中选择 `build/distributions/bplugin-1.5.0.888888-SNAPSHOT.zip`，按 IDE 提示重启。
 
 K线浮窗可通过右下角「关闭」按钮关闭，焦点位于浮窗内时也可按 Esc。关闭后可从行情列表或状态栏重新打开。
 
@@ -43,7 +44,9 @@ K线浮窗可通过右下角「关闭」按钮关闭，焦点位于浮窗内时�
 
 自选导出格式为 `symbol<TAB>group<TAB>note`。导入同时兼容每行一个交易对以及逗号分隔格式；旧版本自选会自动显示在“默认”分组。
 
-行情窗口中的“模拟交易”按钮会打开本地模拟账户。初始资金、手续费和市价滑点可在 Quiet Crypto 设置中调整；调整初始资金后，需要在模拟交易窗口中重置账户才会生效。
+行情窗口中的“交易账户”按钮可在本地模拟和币安测试网间切换。初始资金、手续费和市价滑点可在 Quiet Crypto 设置中调整；调整初始资金后，需要在模拟交易窗口中重置账户才会生效。
+
+测试网模式需要在设置页填写 Binance Spot Testnet 的 HMAC API Key 和 Secret。API Secret 仅保存到 IntelliJ PasswordSafe；插件的交易客户端固定连接 `testnet.binance.vision`，不包含正式交易主机。
 
 ## 构建
 
@@ -70,4 +73,4 @@ K线浮窗可通过右下角「关闭」按钮关闭，焦点位于浮窗内时�
 
 K线边界采用币安默认 UTC，图中时间标签按本机时区显示。
 
-当前版本采用 REST + WebSocket：REST 加载交易对、历史 K线并定期校准，WebSocket 推送实时 ticker 和当前 K线。范围仍为现货公共行情，不包含账户资产和交易。
+公共行情采用 REST + WebSocket：REST 加载交易对、历史 K线并定期校准，WebSocket 推送实时 ticker 和当前 K线。测试网交易固定使用 `https://testnet.binance.vision`，账户事件使用 `wss://ws-api.testnet.binance.vision/ws-api/v3`；REST 在启动和重连后校准资产与订单。

@@ -91,8 +91,10 @@ class CryptoUiTest : BasePlatformTestCase() {
                 paper.reset()
                 paper.place("BTCUSDT", PaperOrderSide.BUY, PaperOrderType.MARKET, BigDecimal("0.05"), null, BigDecimal("64250.10"))
                 render(CryptoPaperPanel(project, "BTCUSDT", PaperOrderSide.BUY), "paper-trading", 1000, 620)
+                render(CryptoTradingPanel(project, "BTCUSDT", PaperOrderSide.BUY), "trading-account", 1040, 680)
+                render(CryptoTestnetPanel(project, "BTCUSDT", PaperOrderSide.BUY), "testnet-trading", 1000, 600)
                 val configurable = CryptoConfigurable()
-                render(configurable.createComponent(), "settings", 720, 700)
+                render(configurable.createComponent(), "settings", 720, 850)
                 assertFalse(configurable.isModified)
                 val widget = CryptoWidget(project)
                 try { render(widget.component, "status", 420, 32) } finally { widget.dispose() }

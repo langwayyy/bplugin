@@ -45,6 +45,8 @@ class CryptoSettings : PersistentStateComponent<CryptoSettings.Options> {
         var paperInitialBalance: String = "10000",
         var paperFeeBps: Int = 10,
         var paperSlippageBps: Int = 2,
+        var tradingMode: String = "LOCAL",
+        var testnetApiKey: String = "",
     )
     private var options = Options()
     override fun getState() = options
@@ -57,6 +59,8 @@ class CryptoSettings : PersistentStateComponent<CryptoSettings.Options> {
             paperInitialBalance = paperInitialBalance.toBigDecimalOrNull()?.takeIf { it.signum() > 0 }?.stripTrailingZeros()?.toPlainString() ?: "10000"
             paperFeeBps = paperFeeBps.coerceIn(0, 100)
             paperSlippageBps = paperSlippageBps.coerceIn(0, 100)
+            tradingMode = tradingMode.takeIf { value -> TradingAccountMode.entries.any { it.name == value } } ?: TradingAccountMode.LOCAL.name
+            testnetApiKey = testnetApiKey.trim().take(200)
             selected = normalizeMarketSymbol(selected).takeIf(::isCryptoSymbol) ?: "BTCUSDT"
             period = period.takeIf { p -> KlinePeriod.entries.any { it.name == p } } ?: "HOUR"
             quote = quote.takeIf { it in listOf("USDT", "USDC", "BTC", "ETH") } ?: "USDT"
@@ -131,6 +135,21 @@ class CryptoConfigurable : Configurable {
     private val paperInitialBalance = JBTextField()
     private val paperFeeBps = JSpinner(SpinnerNumberModel(10, 0, 100, 1))
     private val paperSlippageBps = JSpinner(SpinnerNumberModel(2, 0, 100, 1))
+    private val tradingMode = ComboBox(TradingAccountMode.entries.toTypedArray())
+    private val testnetApiKey = JBTextField()
+    private val testnetSecret = JBPasswordField()
+    private val testnetConnection = JBLabel("仅连接 Binance Spot Testnet，不支持正式交易")
+    private val testTestnet = JButton("测试测试网账户").apply { addActionListener {
+        val key = testnetApiKey.text.trim(); val secret = String(testnetSecret.password)
+        isEnabled = false; testnetConnection.text = "正在验证测试网账户…"
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val result = runCatching { BinanceTestnetClient().let { it.synchronizeTime(); it.account(key, secret) } }
+            ApplicationManager.getApplication().invokeLater {
+                isEnabled = true
+                testnetConnection.text = result.fold({ "测试网连接正常，发现 ${it.size} 项非零资产" }, { "连接失败：${it.message}" })
+            }
+        }
+    } }
     private val connection = JBLabel("公共行情无需账号、API Key 或 Cookie")
     private val test = JButton("测试连接").apply { addActionListener {
         isEnabled = false
@@ -161,6 +180,15 @@ class CryptoConfigurable : Configurable {
             .addSeparator().addLabeledComponent("模拟盘初始 USDT", paperInitialBalance)
             .addLabeledComponent("模拟手续费（基点，10 = 0.1%）", paperFeeBps)
             .addLabeledComponent("市价滑点（基点）", paperSlippageBps)
+            .addSeparator().addLabeledComponent("交易账户模式", tradingMode)
+            .addLabeledComponent("测试网 API Key", testnetApiKey)
+            .addLabeledComponent("测试网 API Secret", testnetSecret)
+            .addComponent(JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply {
+                add(testTestnet); add(JButton("删除测试网凭据").apply { addActionListener {
+                    BinanceTestnetCredentials.clear(); testnetApiKey.text = ""; testnetSecret.text = ""
+                    testnetConnection.text = "测试网凭据已删除"
+                } })
+            }).addComponent(testnetConnection)
             .addComponentFillVertically(JPanel(), 0).panel
     }
     private fun value() = CryptoSettings.getInstance().state.copy(
@@ -170,11 +198,14 @@ class CryptoConfigurable : Configurable {
         color = color.isSelected, background = background.isSelected, opacity = opacity.value as Int, autoRotate = rotate.isSelected,
         alertsEnabled = alerts.isSelected, alertCooldownMinutes = alertCooldown.value as Int,
         paperInitialBalance = paperInitialBalance.text.trim(), paperFeeBps = paperFeeBps.value as Int,
-        paperSlippageBps = paperSlippageBps.value as Int)
-    override fun isModified() = value() != CryptoSettings.getInstance().state
+        paperSlippageBps = paperSlippageBps.value as Int, tradingMode = (tradingMode.selectedItem as TradingAccountMode).name,
+        testnetApiKey = testnetApiKey.text.trim())
+    override fun isModified() = value() != CryptoSettings.getInstance().state || String(testnetSecret.password) != BinanceTestnetCredentials.secret()
     override fun apply() {
         CryptoSettings.getInstance().loadState(value())
+        BinanceTestnetCredentials.save(String(testnetSecret.password))
         CryptoPaperTradingService.getInstance().reloadConfiguration()
+        CryptoTestnetTradingService.getInstance().credentialsChanged()
         CryptoMarketService.getInstance().refresh()
         CryptoBackgrounds.getInstance().sync()
     }
@@ -186,6 +217,8 @@ class CryptoConfigurable : Configurable {
         color.isSelected = s.color; background.isSelected = s.background; opacity.value = s.opacity; rotate.isSelected = s.autoRotate
         alerts.isSelected = s.alertsEnabled; alertCooldown.value = s.alertCooldownMinutes; updateAlertCount()
         paperInitialBalance.text = s.paperInitialBalance; paperFeeBps.value = s.paperFeeBps; paperSlippageBps.value = s.paperSlippageBps
+        tradingMode.selectedItem = TradingAccountMode.entries.firstOrNull { it.name == s.tradingMode } ?: TradingAccountMode.LOCAL
+        testnetApiKey.text = s.testnetApiKey; testnetSecret.text = BinanceTestnetCredentials.secret()
     }
     private fun updateAlertCount() { alertCount.text = "已配置 ${CryptoSettings.getInstance().alertRules().size} 条提醒  " }
 }

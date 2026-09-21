@@ -114,7 +114,7 @@ class CryptoPanel(private val project: Project?) : JPanel(BorderLayout(0, JBUI.s
         add(JPanel(BorderLayout()).apply {
             add(JPanel(FlowLayout(FlowLayout.LEFT)).apply {
                 add(search); add(quote); add(matches); add(add); add(JBLabel("分组")); add(groupFilter)
-                add(JButton("模拟交易").apply { addActionListener { CryptoPaperPopup.show(project) } })
+                add(JButton("交易账户").apply { addActionListener { CryptoPaperPopup.show(project) } })
                 add(JButton("刷新").apply { addActionListener { service.refresh() } })
                 add(JButton("设置").apply { addActionListener { ShowSettingsUtil.getInstance().showSettingsDialog(project, CryptoConfigurable::class.java) } })
             }, BorderLayout.NORTH)
@@ -192,8 +192,8 @@ class CryptoPanel(private val project: Project?) : JPanel(BorderLayout(0, JBUI.s
             }
             item("移动到分组…") { editGroup(symbol) }
             item("编辑备注…") { editNote(symbol) }
-            item("模拟买入…") { CryptoPaperPopup.show(project, symbol, PaperOrderSide.BUY) }
-            item("模拟卖出…") { CryptoPaperPopup.show(project, symbol, PaperOrderSide.SELL) }
+            item("交易买入…") { CryptoPaperPopup.show(project, symbol, PaperOrderSide.BUY) }
+            item("交易卖出…") { CryptoPaperPopup.show(project, symbol, PaperOrderSide.SELL) }
             add(JMenu("设置静默提醒").apply {
                 AlertCondition.entries.forEach { condition ->
                     add(JMenuItem(condition.displayName).apply { addActionListener { addAlert(symbol, condition) } })
