@@ -34,4 +34,16 @@ class BinanceMarketClientTest {
     fun `malformed candle cannot enter chart renderer`() {
         BinanceMarketClient.parseKlines("""[[1700000000000,"2","1","0.5","2.5","100"]]""")
     }
+    @Test fun `websocket ticker updates exact decimal values`() {
+        val update = BinanceStreamClient.parseStreamUpdate("""{"stream":"btcusdt@ticker","data":{"e":"24hrTicker","E":1700000000123,"s":"BTCUSDT","c":"64250.12000000","P":"2.36","h":"65000","l":"62000","q":"123456789.12"}}""")
+        assertEquals("BTCUSDT", update.quote?.symbol)
+        assertEquals(BigDecimal("64250.12000000"), update.quote?.price)
+        assertNull(update.candle)
+    }
+    @Test fun `websocket candle maps interval and close state`() {
+        val update = BinanceStreamClient.parseStreamUpdate("""{"data":{"e":"kline","E":1700000001000,"s":"ETHUSDT","k":{"t":1700000000000,"s":"ETHUSDT","i":"1h","o":"3500","h":"3520","l":"3490","c":"3510","v":"120.5","x":false}}}""")
+        assertEquals(KlinePeriod.HOUR, update.candle?.period)
+        assertEquals(3510.0, update.candle?.bar?.close ?: 0.0, 0.0001)
+        assertFalse(update.candle?.closed ?: true)
+    }
 }

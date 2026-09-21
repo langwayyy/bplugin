@@ -5,6 +5,7 @@ import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.Service
 import com.intellij.util.concurrency.AppExecutorUtil
 import java.time.Instant
+import java.time.Duration
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -16,6 +17,8 @@ class CryptoMarketService : Disposable {
     @Volatile var updated: Instant? = null; private set
     @Volatile var chart: ChartSnapshot? = null; internal set
     @Volatile var chartError: String? = null; private set
+    @Volatile var streamConnected = false; private set
+    @Volatile var streamMessage: String? = null; private set
     private val busy = AtomicBoolean()
     private val chartBusy = AtomicBoolean()
     private var nextRefresh = 0L
@@ -23,19 +26,28 @@ class CryptoMarketService : Disposable {
     private var failures = 0
     private var refreshPending = false
     private var catalogUpdated = Instant.EPOCH
+    private var streamFailures = 0
+    private var streamRetryAt = Instant.EPOCH
     @Volatile private var disposed = false
+    private val stream = BinanceStreamClient(
+        onUpdate = { update -> ApplicationManager.getApplication().invokeLater { applyStreamUpdate(update) } },
+        onState = { connected, message -> ApplicationManager.getApplication().invokeLater { applyStreamState(connected, message) } },
+    )
     private val schedule = AppExecutorUtil.getAppScheduledExecutorService().scheduleWithFixedDelay({
         ApplicationManager.getApplication().invokeLater {
             if (disposed) return@invokeLater
             val s = CryptoSettings.getInstance().state
-            if (!s.enabled || s.interval == 0 || (s.pauseInactive && !ApplicationManager.getApplication().isActive)) return@invokeLater
+            if (!s.enabled) { stopRealtime(null); return@invokeLater }
+            if (s.pauseInactive && !ApplicationManager.getApplication().isActive) { stopRealtime("后台刷新已暂停"); return@invokeLater }
             val now = System.currentTimeMillis()
             if (s.autoRotate && s.rotation.isNotEmpty() && now >= nextRotation) {
                 s.selected = s.rotation[(s.rotation.indexOf(s.selected) + 1).mod(s.rotation.size)]
                 nextRotation = now + 30_000
             }
-            if (now >= nextRefresh) {
-                nextRefresh = now + s.interval * 1_000L
+            ensureRealtime()
+            if (s.interval != 0 && now >= nextRefresh) {
+                val seconds = if (streamConnected) maxOf(s.interval, 60) else s.interval
+                nextRefresh = now + seconds * 1_000L
                 refresh()
                 if (s.background || chartViewers > 0) refreshChart()
             }
@@ -72,6 +84,7 @@ class CryptoMarketService : Disposable {
     }
     fun select(symbol: String) {
         CryptoSettings.getInstance().state.selected = normalizeMarketSymbol(symbol)
+        stopRealtime("正在切换实时订阅")
         refreshChart()
     }
     fun refreshChart() {
@@ -93,16 +106,64 @@ class CryptoMarketService : Disposable {
         }
     }
     fun pair(symbol: String) = pairs.firstOrNull { it.symbol == symbol }
+    private fun ensureRealtime() {
+        val s = CryptoSettings.getInstance().state
+        if (!s.realtime || Instant.now().isBefore(streamRetryAt)) { if (!s.realtime) stopRealtime(null); return }
+        val stale = stream.lastMessageAt?.let { Duration.between(it, Instant.now()).seconds > 45 } == true
+        val aged = stream.connectedAt?.let { Duration.between(it, Instant.now()).toMinutes() >= 1_435 } == true
+        if (stale || aged) stream.disconnect(if (stale) "实时行情超时，正在重连" else "实时连接定期重建")
+        val symbols = (s.watchlist + s.statusSymbols + s.selected).filter(::isCryptoSymbol).distinct().take(100)
+        if (symbols.isNotEmpty()) stream.ensure(StreamSpec(symbols, s.selected, CryptoSettings.getInstance().period()))
+    }
+    private fun stopRealtime(message: String?) {
+        stream.disconnect()
+        streamConnected = false
+        streamMessage = message
+    }
+    private fun applyStreamState(connected: Boolean, message: String?) {
+        if (disposed) return
+        streamConnected = connected
+        streamMessage = message
+        if (connected) {
+            streamFailures = 0; streamRetryAt = Instant.EPOCH
+        } else if (message != null && !message.contains("正在")) {
+            streamFailures = (streamFailures + 1).coerceAtMost(6)
+            streamRetryAt = Instant.now().plusSeconds((2L shl streamFailures).coerceAtMost(120))
+        }
+    }
+    private fun applyStreamUpdate(update: StreamUpdate) {
+        if (disposed || !CryptoSettings.getInstance().state.enabled) return
+        update.quote?.let { quote ->
+            quotes = quotes.toMutableMap().apply { put(quote.symbol, quote) }
+            updated = quote.updatedAt; error = null
+        }
+        update.candle?.let { candle ->
+            val current = chart
+            if (current?.symbol == candle.symbol && current.period == candle.period) {
+                val bars = current.bars.toMutableList()
+                val existing = bars.indexOfLast { it.timestamp == candle.bar.timestamp }
+                if (existing >= 0) bars[existing] = candle.bar else bars.add(candle.bar)
+                chart = current.copy(bars = bars.sortedBy(KlineBar::timestamp).takeLast(350), updatedAt = Instant.now())
+                chartError = null
+            }
+        }
+    }
     fun status(): String {
         val s = CryptoSettings.getInstance().state
         if (!s.enabled) return "币安行情已停用，可在设置中启用"
         if (loading) return "正在刷新币安现货…"
         val time = updated?.atZone(java.time.ZoneId.systemDefault())?.toLocalTime()?.withNano(0)
-        val mode = if (s.interval == 0) "手动刷新" else if (s.pauseInactive && !ApplicationManager.getApplication().isActive) "后台刷新已暂停" else "${s.interval}秒刷新"
+        val mode = when {
+            s.pauseInactive && !ApplicationManager.getApplication().isActive -> "后台刷新已暂停"
+            s.realtime && streamConnected -> "实时"
+            s.realtime && streamMessage != null -> "实时重连中"
+            s.interval == 0 -> "手动刷新"
+            else -> "${s.interval}秒刷新"
+        }
         return error?.let { "$it · 数据已过期 · 最后更新 ${time ?: "—"}" }
             ?: "币安现货 · $mode · 更新于 ${time ?: "—"}"
     }
-    override fun dispose() { disposed = true; schedule.cancel(false) }
+    override fun dispose() { disposed = true; schedule.cancel(false); stream.close() }
     companion object { fun getInstance() = ApplicationManager.getApplication().getService(CryptoMarketService::class.java) }
 }
 data class ChartSnapshot(val symbol: String, val period: KlinePeriod, val bars: List<KlineBar>, val updatedAt: Instant)

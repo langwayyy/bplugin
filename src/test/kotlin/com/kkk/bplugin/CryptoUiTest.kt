@@ -14,6 +14,9 @@ import javax.swing.JComponent
 /** Exercises real IntelliJ services and Swing construction without network requests. */
 class CryptoUiTest : BasePlatformTestCase() {
     fun testChartCloseButtonEscapeAndReopenReleaseViewers() {
+        verifyChartCloseLifecycle()
+    }
+    private fun verifyChartCloseLifecycle() {
         val settings = CryptoSettings.getInstance()
         val before = settings.state.copy()
         settings.loadState(CryptoSettings.Options(enabled = false))
@@ -64,7 +67,11 @@ class CryptoUiTest : BasePlatformTestCase() {
             }, Instant.now())
             UIUtil.invokeAndWaitIfNeeded {
                 render(CryptoPanel(project), "watchlist", 1000, 540)
-                render(CryptoChartCanvas(), "chart", 780, 430)
+                val chart = CryptoChartCanvas()
+                render(chart, "chart", 780, 430)
+                chart.dispatchEvent(java.awt.event.MouseEvent(chart, java.awt.event.MouseEvent.MOUSE_MOVED,
+                    System.currentTimeMillis(), 0, 420, 210, 0, false))
+                render(chart, "chart-crosshair", 780, 430)
                 val configurable = CryptoConfigurable()
                 render(configurable.createComponent(), "settings", 720, 550)
                 assertFalse(configurable.isModified)

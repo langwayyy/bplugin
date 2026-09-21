@@ -53,15 +53,7 @@ class BinanceMarketClient {
     fun klines(symbol: String, period: KlinePeriod): List<KlineBar> {
         check(CryptoSettings.getInstance().state.enabled) { "请先在设置中启用币安行情" }
         require(isCryptoSymbol(symbol))
-        val interval = when (period) {
-            KlinePeriod.INTRADAY -> "1m"
-            KlinePeriod.MINUTE5 -> "5m"
-            KlinePeriod.MINUTE15 -> "15m"
-            KlinePeriod.HOUR -> "1h"
-            KlinePeriod.HOUR4 -> "4h"
-            KlinePeriod.DAY -> "1d"
-            KlinePeriod.WEEK -> "1w"
-        }
+        val interval = period.binanceInterval()
         return parseKlines(get("/api/v3/klines?symbol=${URLEncoder.encode(symbol, Charsets.UTF_8)}&interval=$interval&limit=350"))
     }
 

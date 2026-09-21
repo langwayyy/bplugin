@@ -18,6 +18,8 @@ import java.awt.*
 import java.awt.event.ComponentAdapter
 import java.awt.event.ComponentEvent
 import java.awt.event.MouseEvent
+import java.awt.event.MouseAdapter
+import java.awt.event.MouseMotionAdapter
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -118,7 +120,20 @@ internal class CryptoChartPanel(private val closeWindow: () -> Unit) : JPanel(Bo
 /** Shared lightweight renderer for the floating chart and non-interactive editor watermark. */
 class CryptoChartCanvas(private val watermark: Boolean = false) : JComponent() {
     private var visibleBars: List<KlineBar> = emptyList()
-    init { isOpaque = false; if (!watermark) toolTipText = "K线" }
+    private var crosshair: Point? = null
+    init {
+        isOpaque = false
+        if (!watermark) {
+            toolTipText = "K线"
+            addMouseMotionListener(object : MouseMotionAdapter() {
+                override fun mouseMoved(event: MouseEvent) { crosshair = event.point; repaint() }
+                override fun mouseDragged(event: MouseEvent) { crosshair = event.point; repaint() }
+            })
+            addMouseListener(object : MouseAdapter() {
+                override fun mouseExited(event: MouseEvent) { crosshair = null; repaint() }
+            })
+        }
+    }
     override fun contains(x: Int, y: Int) = !watermark && super.contains(x, y)
     override fun getToolTipText(event: MouseEvent): String? {
         val plotWidth = (width - 108).coerceAtLeast(1)
@@ -143,7 +158,7 @@ class CryptoChartCanvas(private val watermark: Boolean = false) : JComponent() {
             }
             val bars = data.bars.takeLast(90); visibleBars = bars
             val plotWidth = (width - 108).coerceAtLeast(1)
-            val top = 40
+            val top = 52
             val plotHeight = ((height - 90) * 0.76).toInt().coerceAtLeast(1)
             val volumeTop = top + plotHeight + 16
             val volumeHeight = (height - volumeTop - 30).coerceAtLeast(1)
@@ -152,6 +167,9 @@ class CryptoChartCanvas(private val watermark: Boolean = false) : JComponent() {
             fun y(value: Double) = top + ((high - value) / range * plotHeight).roundToInt()
             val title = "${service.pair(s.selected) ?: s.selected} · ${data.period.label} · ${price(bars.last().close)}"
             g.drawString(title, 12, 22)
+            g.color = JBColor(0xD08A22, 0xF2B84B); g.drawString("MA5", 12, 40)
+            g.color = JBColor(0x5479B8, 0x83A9E8); g.drawString("MA10", 52, 40)
+            g.color = JBColor(0x8B5FA8, 0xBE8CDB); g.drawString("MA20", 100, 40)
             if (service.chartError != null) g.drawString("数据已过期", (width - 100).coerceAtLeast(12), 22)
             repeat(5) { step ->
                 val y = top + plotHeight * step / 4
@@ -168,6 +186,39 @@ class CryptoChartCanvas(private val watermark: Boolean = false) : JComponent() {
                 g.fillRect(x - bodyWidth / 2, min(y(bar.open), y(bar.close)), bodyWidth, abs(y(bar.open) - y(bar.close)).coerceAtLeast(1))
                 val volume = (bar.volume / maxVolume * volumeHeight).toInt()
                 g.fillRect(x - bodyWidth / 2, volumeTop + volumeHeight - volume, bodyWidth, volume)
+            }
+            fun drawAverage(window: Int, color: Color) {
+                g.color = color
+                g.stroke = BasicStroke(if (watermark) 1f else 1.4f)
+                val path = java.awt.geom.Path2D.Double()
+                var started = false
+                bars.indices.forEach { index ->
+                    if (index + 1 < window) return@forEach
+                    val average = bars.subList(index + 1 - window, index + 1).sumOf(KlineBar::close) / window
+                    val x = 12 + ((index + 0.5) * stride)
+                    if (!started) { path.moveTo(x, y(average).toDouble()); started = true } else path.lineTo(x, y(average).toDouble())
+                }
+                if (started) g.draw(path)
+            }
+            drawAverage(5, JBColor(0xD08A22, 0xF2B84B))
+            drawAverage(10, JBColor(0x5479B8, 0x83A9E8))
+            drawAverage(20, JBColor(0x8B5FA8, 0xBE8CDB))
+            if (!watermark) crosshair?.let { point ->
+                if (point.x in 12..(plotWidth + 12) && point.y in top..(top + plotHeight)) {
+                    val index = (((point.x - 12) / stride).toInt()).coerceIn(0, bars.lastIndex)
+                    val bar = bars[index]
+                    val x = 12 + ((index + 0.5) * stride).toInt()
+                    g.color = JBColor(0x777777, 0xAAAAAA)
+                    g.stroke = BasicStroke(1f, BasicStroke.CAP_BUTT, BasicStroke.JOIN_MITER, 1f, floatArrayOf(4f, 4f), 0f)
+                    g.drawLine(x, top, x, volumeTop + volumeHeight)
+                    g.drawLine(12, point.y, plotWidth + 12, point.y)
+                    val detail = "${chartTime(Instant.ofEpochMilli(bar.timestamp))}  开 ${price(bar.open)}  高 ${price(bar.high)}  低 ${price(bar.low)}  收 ${price(bar.close)}  量 ${price(bar.volume)}"
+                    val boxWidth = (g.fontMetrics.stringWidth(detail) + 14).coerceAtMost(width - 24)
+                    g.color = JBColor(0xF3F3F3, 0x343434)
+                    g.fillRoundRect(12, (height - 31).coerceAtLeast(0), boxWidth, 22, 6, 6)
+                    g.color = JBColor.foreground()
+                    g.drawString(detail, 19, height - 16)
+                }
             }
             g.color = JBColor.GRAY
             g.drawString(chartTime(Instant.ofEpochMilli(bars.first().timestamp)), 12, height - 8)

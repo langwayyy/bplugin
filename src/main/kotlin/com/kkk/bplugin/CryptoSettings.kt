@@ -20,6 +20,7 @@ class CryptoSettings : PersistentStateComponent<CryptoSettings.Options> {
     data class Options(
         var enabled: Boolean = true,
         var interval: Int = 10,
+        var realtime: Boolean = true,
         var pauseInactive: Boolean = true,
         var quote: String = "USDT",
         var decimals: Int = -1,
@@ -58,6 +59,7 @@ class CryptoConfigurable : Configurable {
     private val enabled = JBCheckBox("启用币安现货公共行情")
     private val pause = JBCheckBox("IDEA 不在前台时暂停自动刷新")
     private val interval = ComboBox(arrayOf("手动", "5秒", "10秒", "30秒"))
+    private val realtime = JBCheckBox("启用 WebSocket 实时价格与当前 K线")
     private val quote = ComboBox(arrayOf("USDT", "USDC", "BTC", "ETH"))
     private val decimals = JSpinner(SpinnerNumberModel(-1, -1, 12, 1))
     private val style = ComboBox(arrayOf("仅价格", "名称 + 价格", "名称 + 涨跌幅", "完整"))
@@ -81,7 +83,7 @@ class CryptoConfigurable : Configurable {
     override fun createComponent(): JComponent {
         reset()
         return FormBuilder.createFormBuilder().addComponent(enabled)
-            .addLabeledComponent("默认报价币", quote).addLabeledComponent("刷新间隔", interval)
+            .addLabeledComponent("默认报价币", quote).addComponent(realtime).addLabeledComponent("REST 校准间隔", interval)
             .addComponent(pause).addLabeledComponent("价格小数位（-1 自动）", decimals)
             .addSeparator().addLabeledComponent("状态栏显示", style).addComponent(color)
             .addSeparator().addComponent(background).addLabeledComponent("背景不透明度 %", opacity)
@@ -89,7 +91,7 @@ class CryptoConfigurable : Configurable {
             .addComponentFillVertically(JPanel(), 0).panel
     }
     private fun value() = CryptoSettings.getInstance().state.copy(
-        enabled = enabled.isSelected, interval = listOf(0, 5, 10, 30)[interval.selectedIndex],
+        enabled = enabled.isSelected, realtime = realtime.isSelected, interval = listOf(0, 5, 10, 30)[interval.selectedIndex],
         quote = quote.selectedItem as String, pauseInactive = pause.isSelected,
         decimals = decimals.value as Int, statusStyle = style.selectedItem as String,
         color = color.isSelected, background = background.isSelected, opacity = opacity.value as Int, autoRotate = rotate.isSelected)
@@ -101,7 +103,7 @@ class CryptoConfigurable : Configurable {
     }
     override fun reset() {
         val s = CryptoSettings.getInstance().state
-        enabled.isSelected = s.enabled; pause.isSelected = s.pauseInactive
+        enabled.isSelected = s.enabled; realtime.isSelected = s.realtime; pause.isSelected = s.pauseInactive
         interval.selectedIndex = listOf(0, 5, 10, 30).indexOf(s.interval).coerceAtLeast(0)
         quote.selectedItem = s.quote; decimals.value = s.decimals; style.selectedItem = s.statusStyle
         color.isSelected = s.color; background.isSelected = s.background; opacity.value = s.opacity; rotate.isSelected = s.autoRotate
