@@ -1,0 +1,62 @@
+# Quiet Crypto
+
+独立的 IntelliJ IDEA 加密货币行情插件。沿用 Quiet Portfolio 的灰色极简风格，独立插件 ID `com.kkk.bplugin`、配置文件 `quiet-crypto.xml` 和快捷键，可以与原插件同时安装。
+
+## 功能
+
+- 币安现货公共行情，无需账户、API Key 或 Cookie。
+- 按名称/交易对搜索，按 USDT、USDC、BTC、ETH 或全部报价币筛选。
+- 本地自选列表：最新价、滚动 24h 涨跌幅、报价币成交额；点击表头排序，上下移动恢复手动顺序。
+- 右键交易对：显示在状态栏、打开 K线浮窗、设为编辑器背景、加入轮播、移除自选。
+- 状态栏最多六个交易对，支持仅价格、名称与价格、名称与涨跌幅、完整信息；点击打开 K线，右键打开列表。
+- 固定、可拖动和缩放的 K线浮窗；1分、5分、15分、1时、4时、日、周周期，成交量及鼠标详情。
+- 编辑器背景 K线默认关闭，不接收鼠标事件；可调整透明度，并可每30秒轮播本地列表。
+- 5秒、10秒、30秒或手动刷新；默认10秒，支持 IDEA 非前台暂停。刷新失败保留本次会话旧数据并显示状态，限流按 Retry-After 暂停。
+- 价格使用十进制解析，自动保留小价格精度。默认灰色，可选择涨红跌绿。
+
+## 使用
+
+在 IDEA 的 `Settings → Plugins → 齿轮 → Install Plugin from Disk` 中选择 `build/distributions/bplugin-1.0.1.888888-SNAPSHOT.zip`，按 IDE 提示重启。
+
+K线浮窗可通过右下角「关闭」按钮关闭，焦点位于浮窗内时也可按 Esc。关闭后可从行情列表或状态栏重新打开。
+
+通过 `Tools → 打开 Quiet Crypto` 或状态栏 `Crypto` 进入。首次等待交易对加载后，搜索并添加自选。状态栏不可见时，在状态栏右键启用 **Quiet Crypto**。
+
+设置入口：`Settings → Tools → Quiet Crypto`。连接使用 IDEA 的 HTTP 代理设置；连接测试会主动请求币安公共接口。停用行情后不再发起自动请求，已在途的响应不会更新界面数据。
+
+快捷键采用两段输入：先按 `Ctrl+Alt+Shift+B`，松开后按：
+
+| 第二段 | 功能 |
+|---|---|
+| P | 行情列表 |
+| W | 固定 K线浮窗 |
+| H | 编辑器背景开关 |
+
+所有图表窗口共享当前选中的交易对和周期。自选、轮播和状态栏名单分别管理。只缓存会话内行情，重启后重新加载；配置和名单持久化。API 获取的是币安现货价格，24h 指滚动24小时，USDT 不标成美元。
+
+## 构建
+
+需要 JDK 21。PowerShell 中执行：
+
+```powershell
+./gradlew.bat test buildPlugin
+./gradlew.bat runIde
+```
+
+目标平台 IDEA 2025.1.3。产物位于 `build/distributions/`。原 `kplugin` 项目不参与编译或运行。
+
+如果本机 Windows/JBR 构建出现 `Unable to establish loopback connection`，可执行以下本机兼容构建。该选项仅为构建进程关闭有问题的 Unix-domain sockets，不会写入安装包或更改系统配置：
+
+```powershell
+./scripts/build.ps1 -JavaHome 'C:/Users/Administrator/.jdks/jbr-21.0.11' -WindowsSocketWorkaround
+```
+
+测试包含数据解析、精度以及 IDEA 服务与 Swing 界面渲染；测试预览输出到 `build/ui-previews/`。
+
+## 数据接口
+
+使用 `https://data-api.binance.vision` 的 `exchangeInfo`、`ticker/24hr`、`klines` 和 `ping`。交易对目录每小时按需更新，行情批量查询；网络请求在后台执行，结果在 UI 线程交付。
+
+K线边界采用币安默认 UTC，图中时间标签按本机时区显示。
+
+第一版采用 REST 轮询，范围为现货行情查询与展示，不包含账户资产、交易和 WebSocket。

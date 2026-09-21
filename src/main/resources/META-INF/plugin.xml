@@ -1,0 +1,28 @@
+<idea-plugin>
+    <id>com.kkk.bplugin</id>
+    <name>Quiet Crypto</name>
+    <vendor>Bplugin</vendor>
+    <description><![CDATA[Low-distraction Binance spot watchlists, status bar prices and candlestick charts. Public market data only.]]></description>
+    <depends>com.intellij.modules.platform</depends>
+    <extensions defaultExtensionNs="com.intellij">
+        <statusBarWidgetFactory id="com.kkk.bplugin.ticker" implementation="com.kkk.bplugin.CryptoWidgetFactory"/>
+        <applicationConfigurable id="com.kkk.bplugin.settings" parentId="tools" displayName="Quiet Crypto" instance="com.kkk.bplugin.CryptoConfigurable"/>
+    </extensions>
+    <applicationListeners>
+        <listener class="com.kkk.bplugin.CryptoEditorListener" topic="com.intellij.openapi.editor.event.EditorFactoryListener"/>
+    </applicationListeners>
+    <actions>
+        <action id="com.kkk.bplugin.Show" class="com.kkk.bplugin.ShowCryptoAction" text="打开 Quiet Crypto">
+            <keyboard-shortcut keymap="$default" first-keystroke="control alt shift B" second-keystroke="P"/>
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+        <action id="com.kkk.bplugin.Chart" class="com.kkk.bplugin.ShowChartAction" text="打开加密货币 K线浮窗">
+            <keyboard-shortcut keymap="$default" first-keystroke="control alt shift B" second-keystroke="W"/>
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+        <action id="com.kkk.bplugin.Background" class="com.kkk.bplugin.ToggleBackgroundAction" text="开关加密货币 K线背景">
+            <keyboard-shortcut keymap="$default" first-keystroke="control alt shift B" second-keystroke="H"/>
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>
