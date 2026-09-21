@@ -97,6 +97,8 @@ class CryptoPaperPanel(private val project: Project?, initialSymbol: String?, in
         }
     }
     private val orderTable = table(orderModel)
+    private val positionTable = table(positionModel)
+    private val historyTable = table(historyModel)
     private val timer = Timer(1_000) { render() }
 
     init {
@@ -115,14 +117,14 @@ class CryptoPaperPanel(private val project: Project?, initialSymbol: String?, in
                 add(JButton("提交模拟订单").apply { addActionListener { submit() } })
             }, BorderLayout.NORTH)
             add(JTabbedPane().apply {
-                addTab("持仓", JBScrollPane(table(positionModel)))
+                addTab("持仓", scroll(positionTable))
                 addTab("当前委托", JPanel(BorderLayout()).apply {
-                    add(JBScrollPane(orderTable), BorderLayout.CENTER)
+                    add(scroll(orderTable), BorderLayout.CENTER)
                     add(JPanel(FlowLayout(FlowLayout.RIGHT)).apply {
                         add(JButton("撤销所选委托").apply { addActionListener { cancelSelected() } })
                     }, BorderLayout.SOUTH)
                 })
-                addTab("成交与撤单", JBScrollPane(table(historyModel)))
+                addTab("成交与撤单", scroll(historyTable))
             }, BorderLayout.CENTER)
             add(message, BorderLayout.SOUTH)
         }, BorderLayout.CENTER)
@@ -204,6 +206,7 @@ class CryptoPaperPanel(private val project: Project?, initialSymbol: String?, in
         rowHeight = JBUI.scale(28); setShowGrid(false); autoCreateRowSorter = true
         emptyText.text = "暂无记录"
     }
+    private fun scroll(table: JBTable) = JBScrollPane(table).apply { setColumnHeaderView(table.tableHeader) }
     private fun signedMoney(value: BigDecimal) = (if (value.signum() > 0) "+" else "") + marketPrice(value, 2) + " USDT"
     private fun time(epochMillis: Long) = TIME.format(Instant.ofEpochMilli(epochMillis))
 

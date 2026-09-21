@@ -13,9 +13,9 @@ import java.util.UUID
 private val BPS = BigDecimal("10000")
 private val ZERO = BigDecimal.ZERO
 
-enum class PaperOrderSide(val label: String) { BUY("买入"), SELL("卖出") }
-enum class PaperOrderType(val label: String) { MARKET("市价"), LIMIT("限价") }
-enum class PaperOrderStatus(val label: String) { OPEN("挂单中"), FILLED("已成交"), CANCELLED("已撤销") }
+enum class PaperOrderSide(val label: String) { BUY("买入"), SELL("卖出"); override fun toString() = label }
+enum class PaperOrderType(val label: String) { MARKET("市价"), LIMIT("限价"); override fun toString() = label }
+enum class PaperOrderStatus(val label: String) { OPEN("挂单中"), FILLED("已成交"), CANCELLED("已撤销"); override fun toString() = label }
 
 data class PaperPosition(
     val symbol: String,
