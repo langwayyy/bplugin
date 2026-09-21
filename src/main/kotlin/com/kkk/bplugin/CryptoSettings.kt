@@ -41,6 +41,7 @@ class CryptoSettings : PersistentStateComponent<CryptoSettings.Options> {
         var alertsEnabled: Boolean = true,
         var alertCooldownMinutes: Int = 30,
         var alertRulesJson: String = "[]",
+        var watchMetadataJson: String = "[]",
     )
     private var options = Options()
     override fun getState() = options
@@ -70,6 +71,39 @@ class CryptoSettings : PersistentStateComponent<CryptoSettings.Options> {
         }
     }.take(100)
     fun saveAlertRules(rules: List<CryptoAlertRule>) { options.alertRulesJson = Gson().toJson(rules.distinctBy(CryptoAlertRule::id).take(100)) }
+    fun watchMetadata(): List<CryptoWatchMetadata> {
+        val saved = runCatching {
+            Gson().fromJson<List<CryptoWatchMetadata>>(options.watchMetadataJson, object : TypeToken<List<CryptoWatchMetadata>>() {}.type)
+        }.getOrDefault(emptyList()).associateBy { normalizeMarketSymbol(it.symbol) }
+        return options.watchlist.map { symbol ->
+            saved[symbol]?.let { CryptoWatchMetadata(symbol, normalizeWatchGroup(it.group), normalizeWatchNote(it.note)) }
+                ?: CryptoWatchMetadata(symbol)
+        }
+    }
+    fun watchMetadata(symbol: String): CryptoWatchMetadata = watchMetadata().firstOrNull { it.symbol == normalizeMarketSymbol(symbol) }
+        ?: CryptoWatchMetadata(normalizeMarketSymbol(symbol))
+    fun saveWatchMetadata(entries: List<CryptoWatchMetadata>) {
+        val allowed = options.watchlist.toSet()
+        options.watchMetadataJson = Gson().toJson(entries.filter { it.symbol in allowed }.distinctBy(CryptoWatchMetadata::symbol).take(100))
+    }
+    fun addWatchSymbol(symbol: String, group: String = DEFAULT_WATCH_GROUP, note: String = "") {
+        val normalized = normalizeMarketSymbol(symbol)
+        if (!isCryptoSymbol(normalized)) return
+        if (normalized !in options.watchlist && options.watchlist.size < 100) options.watchlist.add(normalized)
+        updateWatchMetadata(normalized, group, note.ifBlank { watchMetadata(normalized).note })
+    }
+    fun removeWatchSymbol(symbol: String) {
+        val normalized = normalizeMarketSymbol(symbol)
+        options.watchlist.remove(normalized)
+        saveWatchMetadata(watchMetadata().filterNot { it.symbol == normalized })
+    }
+    fun updateWatchMetadata(symbol: String, group: String, note: String) {
+        val normalized = normalizeMarketSymbol(symbol)
+        val entries = watchMetadata().filterNot { it.symbol == normalized } +
+            CryptoWatchMetadata(normalized, normalizeWatchGroup(group), normalizeWatchNote(note))
+        saveWatchMetadata(entries)
+    }
+    fun watchGroups(): List<String> = watchMetadata().map(CryptoWatchMetadata::group).distinct().sorted()
     companion object { fun getInstance() = ApplicationManager.getApplication().getService(CryptoSettings::class.java) }
 }
 

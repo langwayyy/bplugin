@@ -56,6 +56,9 @@ class CryptoUiTest : BasePlatformTestCase() {
             settings.loadState(CryptoSettings.Options(enabled = false,
                 watchlist = mutableListOf("BTCUSDT", "ETHUSDT", "SHIBUSDT"),
                 statusSymbols = mutableListOf("BTCUSDT", "SHIBUSDT")))
+            settings.updateWatchMetadata("BTCUSDT", "主流币", "核心观察")
+            settings.updateWatchMetadata("ETHUSDT", "主流币", "等待突破")
+            settings.updateWatchMetadata("SHIBUSDT", "高波动", "控制仓位")
             val service = CryptoMarketService.getInstance()
             service.pairs = listOf(CryptoPair("BTCUSDT", "BTC", "USDT"), CryptoPair("ETHUSDT", "ETH", "USDT"), CryptoPair("SHIBUSDT", "SHIB", "USDT"))
             service.quotes = listOf("BTCUSDT" to "64250.10", "ETHUSDT" to "3520.80", "SHIBUSDT" to "0.00001234").associate { (symbol, price) ->
