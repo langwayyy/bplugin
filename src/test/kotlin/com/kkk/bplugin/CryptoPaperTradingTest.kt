@@ -46,6 +46,17 @@ class CryptoPaperTradingTest : TestCase() {
         assertEquals("2", book.availableQuantity("BTCUSDT").toPlainString())
     }
 
+    fun testCrossingLimitOrderFillsImmediately() {
+        val book = PaperTradingBook(PaperAccount(), feeBps = 0, slippageBps = 0)
+        val result = book.place("BTCUSDT", PaperOrderSide.BUY, PaperOrderType.LIMIT,
+            BigDecimal.ONE, BigDecimal("101"), BigDecimal("100"))
+
+        assertTrue(result.accepted)
+        val filled = requireNotNull(result.order)
+        assertEquals(PaperOrderStatus.FILLED, filled.status)
+        assertEquals("100", filled.fillPrice!!.toPlainString())
+    }
+
     fun testRejectsNonUsdtAndMissingMarketPrice() {
         val book = PaperTradingBook()
         assertFalse(book.place("ETHBTC", PaperOrderSide.BUY, PaperOrderType.MARKET,

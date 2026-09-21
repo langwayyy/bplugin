@@ -86,7 +86,9 @@ internal class PaperTradingBook(
             quantity = quantity.stripTrailingZeros(), limitPrice = limitPrice?.stripTrailingZeros())
         account = account.copy(orders = (listOf(order) + account.orders).take(500))
         if (type == PaperOrderType.MARKET) fill(order.id, slipped(marketPrice!!, side))
-        return PaperTradeResult(true, if (type == PaperOrderType.MARKET) "模拟订单已成交" else "模拟限价单已提交", account.orders.first { it.id == order.id })
+        else if (marketPrice != null) onPrice(normalized, marketPrice)
+        val accepted = account.orders.first { it.id == order.id }
+        return PaperTradeResult(true, if (accepted.status == PaperOrderStatus.FILLED) "模拟订单已成交" else "模拟限价单已提交", accepted)
     }
 
     fun onPrice(symbol: String, price: BigDecimal): Boolean {
@@ -194,13 +196,21 @@ class CryptoPaperTradingService : PersistentStateComponent<CryptoPaperTradingSer
     }
 
     @Synchronized fun account(): PaperAccount = book.account
+    @Synchronized fun trackedSymbols(): List<String> = (book.account.positions.map(PaperPosition::symbol) +
+        book.account.orders.filter { it.status == PaperOrderStatus.OPEN }.map(PaperOrder::symbol)).distinct()
     @Synchronized fun summary(prices: Map<String, BigDecimal>): PaperAccountSummary = book.summary(prices)
     @Synchronized fun availableQuantity(symbol: String): BigDecimal = book.availableQuantity(normalizeMarketSymbol(symbol))
     @Synchronized fun place(symbol: String, side: PaperOrderSide, type: PaperOrderType, quantity: BigDecimal,
-                            limitPrice: BigDecimal?, marketPrice: BigDecimal?): PaperTradeResult =
-        book.place(symbol, side, type, quantity, limitPrice, marketPrice).also { if (it.accepted) save() }
+                            limitPrice: BigDecimal?, marketPrice: BigDecimal?): PaperTradeResult {
+        val normalized = normalizeMarketSymbol(symbol)
+        val market = CryptoMarketService.getInstance()
+        if (market.pair(normalized) == null && market.quotes[normalized] == null)
+            return PaperTradeResult(false, "未知交易对，请先加载币安交易对目录")
+        return book.place(normalized, side, type, quantity, limitPrice, marketPrice).also { if (it.accepted) save() }
+    }
     @Synchronized fun cancel(id: String): Boolean = book.cancel(id).also { if (it) save() }
     @Synchronized fun onQuote(quote: CryptoQuote) { if (book.onPrice(quote.symbol, quote.price)) save() }
+    @Synchronized fun reloadConfiguration() { book = newBook(book.account); save() }
     @Synchronized fun reset() { book = newBook(null); save() }
 
     private fun newBook(account: PaperAccount?): PaperTradingBook {

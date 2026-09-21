@@ -174,6 +174,7 @@ class CryptoConfigurable : Configurable {
     override fun isModified() = value() != CryptoSettings.getInstance().state
     override fun apply() {
         CryptoSettings.getInstance().loadState(value())
+        CryptoPaperTradingService.getInstance().reloadConfiguration()
         CryptoMarketService.getInstance().refresh()
         CryptoBackgrounds.getInstance().sync()
     }

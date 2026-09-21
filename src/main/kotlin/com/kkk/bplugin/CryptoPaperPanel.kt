@@ -55,8 +55,8 @@ class CryptoPaperPanel(private val project: Project?, initialSymbol: String?, in
             return when (column) {
                 0 -> market.pair(item.symbol)?.toString() ?: item.symbol
                 1 -> marketPrice(item.quantity)
-                2 -> marketPrice(item.averageCost)
-                3 -> marketPrice(latest)
+                2 -> displayPrice(item.averageCost)
+                3 -> displayPrice(latest)
                 4 -> marketPrice(item.quantity * latest, 2)
                 else -> signedMoney(item.quantity * (latest - item.averageCost))
             }
@@ -90,7 +90,7 @@ class CryptoPaperPanel(private val project: Project?, initialSymbol: String?, in
                 2 -> item.side.label
                 3 -> item.type.label
                 4 -> marketPrice(item.quantity)
-                5 -> item.fillPrice?.let(::marketPrice) ?: "—"
+                5 -> item.fillPrice?.let(::displayPrice) ?: "—"
                 6 -> marketPrice(item.fee, 4)
                 else -> item.status.label
             }
@@ -148,7 +148,7 @@ class CryptoPaperPanel(private val project: Project?, initialSymbol: String?, in
         val result = trading.place(selectedSymbol, side.selectedItem as PaperOrderSide, orderType, amount,
             limit, market.quotes[selectedSymbol]?.price)
         message.text = result.message
-        if (result.accepted) { quantity.text = ""; if (orderType == PaperOrderType.MARKET) price.text = "" }
+        if (result.accepted) { quantity.text = ""; if (orderType == PaperOrderType.MARKET) price.text = ""; market.refresh() }
         fingerprint = ""
         render()
     }
@@ -179,7 +179,7 @@ class CryptoPaperPanel(private val project: Project?, initialSymbol: String?, in
         fingerprint = next
         balance.text = "现金：${marketPrice(summary.cash, 2)} USDT（可用 ${marketPrice(summary.availableCash, 2)}）"
         equity.text = "总资产：${marketPrice(summary.equity, 2)} USDT"
-        pnl.text = "总收益：${signedMoney(summary.totalReturn)}"
+        pnl.text = "浮动：${signedMoney(summary.unrealizedPnl)} · 已实现：${signedMoney(summary.realizedPnl)} · 总收益：${signedMoney(summary.totalReturn)}"
         pnl.foreground = when { summary.totalReturn.signum() > 0 -> JBColor(0xD64242, 0xFF6B6B); summary.totalReturn.signum() < 0 -> JBColor(0x2A9955, 0x62C985); else -> JBColor.foreground() }
         positions = account.positions
         openOrders = account.orders.filter { it.status == PaperOrderStatus.OPEN }
@@ -208,6 +208,7 @@ class CryptoPaperPanel(private val project: Project?, initialSymbol: String?, in
     }
     private fun scroll(table: JBTable) = JBScrollPane(table).apply { setColumnHeaderView(table.tableHeader) }
     private fun signedMoney(value: BigDecimal) = (if (value.signum() > 0) "+" else "") + marketPrice(value, 2) + " USDT"
+    private fun displayPrice(value: BigDecimal) = marketPrice(value, if (value >= BigDecimal.ONE) 4 else -1)
     private fun time(epochMillis: Long) = TIME.format(Instant.ofEpochMilli(epochMillis))
 
     companion object { private val TIME = DateTimeFormatter.ofPattern("MM-dd HH:mm:ss").withZone(ZoneId.systemDefault()) }
