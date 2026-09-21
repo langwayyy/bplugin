@@ -74,6 +74,13 @@ class CryptoUiTest : BasePlatformTestCase() {
                     System.currentTimeMillis(), 0, 400, 200, 0, false,
                     java.awt.event.MouseWheelEvent.WHEEL_UNIT_SCROLL, 1, -1))
                 assertTrue(chart.viewportState().first < initialViewport.first)
+                chart.dispatchEvent(java.awt.event.MouseEvent(chart, java.awt.event.MouseEvent.MOUSE_PRESSED,
+                    System.currentTimeMillis(), 0, 300, 200, 1, false, java.awt.event.MouseEvent.BUTTON1))
+                chart.dispatchEvent(java.awt.event.MouseEvent(chart, java.awt.event.MouseEvent.MOUSE_DRAGGED,
+                    System.currentTimeMillis(), java.awt.event.MouseEvent.BUTTON1_DOWN_MASK, 420, 200, 0, false, java.awt.event.MouseEvent.BUTTON1))
+                chart.dispatchEvent(java.awt.event.MouseEvent(chart, java.awt.event.MouseEvent.MOUSE_RELEASED,
+                    System.currentTimeMillis(), 0, 420, 200, 1, false, java.awt.event.MouseEvent.BUTTON1))
+                assertTrue(chart.viewportState().second > 0)
                 chart.dispatchEvent(java.awt.event.MouseEvent(chart, java.awt.event.MouseEvent.MOUSE_MOVED,
                     System.currentTimeMillis(), 0, 420, 210, 0, false))
                 render(chart, "chart-crosshair", 780, 430)

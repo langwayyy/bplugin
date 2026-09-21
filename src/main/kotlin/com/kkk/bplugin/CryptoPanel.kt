@@ -185,7 +185,7 @@ class CryptoPanel(private val project: Project?) : JPanel(BorderLayout(0, JBUI.s
             AlertCondition.CHANGE_BELOW -> threshold.signum() <= 0
         }
         if (!valid) { Messages.showErrorDialog(project, "请输入有效阈值；跌幅提醒使用负数，例如 -5。", "无法添加提醒"); return }
-        val rule = CryptoAlertRule(symbol = symbol, condition = condition, threshold = threshold!!)
+        val rule = CryptoAlertRule(symbol = symbol, condition = condition, threshold = threshold)
         val serviceSettings = CryptoSettings.getInstance()
         serviceSettings.saveAlertRules(serviceSettings.alertRules() + rule)
         message.text = "已添加提醒：${rule.description()}"

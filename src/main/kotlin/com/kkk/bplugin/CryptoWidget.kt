@@ -73,6 +73,20 @@ class CryptoWidget(private val project: Project) : CustomStatusBarWidget {
                 })
             })
         }
+        service.activeAlerts.firstOrNull { it.symbol !in symbols }?.let { event ->
+            panel.add(JBLabel("! ${service.pair(event.symbol)?.base ?: event.symbol}").apply {
+                border = JBUI.Borders.empty(0, 2)
+                foreground = JBColor(0xB5792A, 0xF2B84B)
+                cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+                toolTipText = event.message
+                addMouseListener(object : MouseAdapter() {
+                    override fun mouseClicked(e: MouseEvent) {
+                        CryptoMarketService.getInstance().select(event.symbol)
+                        CryptoChartWindow.getInstance(project).show()
+                    }
+                })
+            })
+        }
         panel.revalidate(); panel.repaint()
     }
 }
