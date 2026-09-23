@@ -26,6 +26,20 @@ data class TestnetOrder(
     val averagePrice: BigDecimal?,
     val status: String,
     val time: Long,
+    val rawType: String = type.name,
+    val stopPrice: BigDecimal = BigDecimal.ZERO,
+    val orderListId: Long = -1,
+    val clientOrderId: String = "",
+)
+
+data class TestnetOrderList(
+    val id: Long,
+    val symbol: String,
+    val contingencyType: String,
+    val status: String,
+    val clientOrderId: String,
+    val time: Long,
+    val orderIds: List<Long>,
 )
 
 data class TestnetTrade(
@@ -108,9 +122,10 @@ class BinanceTestnetClient {
             } }.sortedByDescending(TestnetTrade::time)
 
     fun placeOrder(symbol: String, side: PaperOrderSide, type: PaperOrderType, quantity: BigDecimal,
-                   price: BigDecimal?, apiKey: String, secret: String): TestnetOrder {
+                   price: BigDecimal?, apiKey: String, secret: String, clientOrderId: String? = null): TestnetOrder {
         val params = linkedMapOf("symbol" to normalizeMarketSymbol(symbol), "side" to side.name, "type" to type.name,
             "quantity" to quantity.stripTrailingZeros().toPlainString(), "newOrderRespType" to "FULL")
+        clientOrderId?.let { params["newClientOrderId"] = it }
         if (type == PaperOrderType.LIMIT) {
             require(price != null && price.signum() > 0)
             params["timeInForce"] = "GTC"
@@ -119,11 +134,51 @@ class BinanceTestnetClient {
         return parseOrder(signed("POST", "/api/v3/order", params, apiKey, secret).asJsonObject)
     }
 
+    fun placeConditionalOrder(symbol: String, side: PaperOrderSide, rawType: String, quantity: BigDecimal,
+                              stopPrice: BigDecimal, limitPrice: BigDecimal, clientOrderId: String,
+                              apiKey: String, secret: String): TestnetOrder {
+        require(rawType in setOf("STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"))
+        val params = linkedMapOf("symbol" to normalizeMarketSymbol(symbol), "side" to side.name, "type" to rawType,
+            "quantity" to quantity.stripTrailingZeros().toPlainString(), "price" to limitPrice.stripTrailingZeros().toPlainString(),
+            "stopPrice" to stopPrice.stripTrailingZeros().toPlainString(), "timeInForce" to "GTC",
+            "newClientOrderId" to clientOrderId, "newOrderRespType" to "FULL")
+        return parseOrder(signed("POST", "/api/v3/order", params, apiKey, secret).asJsonObject)
+    }
+
+    fun placeOco(symbol: String, side: PaperOrderSide, quantity: BigDecimal, targetPrice: BigDecimal,
+                 stopPrice: BigDecimal, stopLimitPrice: BigDecimal, listClientOrderId: String,
+                 apiKey: String, secret: String): TestnetOrderList {
+        val params = linkedMapOf("symbol" to normalizeMarketSymbol(symbol), "side" to side.name,
+            "quantity" to quantity.stripTrailingZeros().toPlainString(), "listClientOrderId" to listClientOrderId,
+            "newOrderRespType" to "FULL")
+        if (side == PaperOrderSide.SELL) {
+            params.putAll(mapOf("aboveType" to "LIMIT_MAKER", "abovePrice" to targetPrice.stripTrailingZeros().toPlainString(),
+                "aboveClientOrderId" to "$listClientOrderId-a", "belowType" to "STOP_LOSS_LIMIT",
+                "belowStopPrice" to stopPrice.stripTrailingZeros().toPlainString(),
+                "belowPrice" to stopLimitPrice.stripTrailingZeros().toPlainString(), "belowTimeInForce" to "GTC",
+                "belowClientOrderId" to "$listClientOrderId-b"))
+        } else {
+            params.putAll(mapOf("aboveType" to "STOP_LOSS_LIMIT", "aboveStopPrice" to stopPrice.stripTrailingZeros().toPlainString(),
+                "abovePrice" to stopLimitPrice.stripTrailingZeros().toPlainString(), "aboveTimeInForce" to "GTC",
+                "aboveClientOrderId" to "$listClientOrderId-a", "belowType" to "LIMIT_MAKER",
+                "belowPrice" to targetPrice.stripTrailingZeros().toPlainString(), "belowClientOrderId" to "$listClientOrderId-b"))
+        }
+        return parseOrderList(signed("POST", "/api/v3/orderList/oco", params, apiKey, secret).asJsonObject)
+    }
+
     fun cancelOrder(symbol: String, orderId: Long, apiKey: String, secret: String): TestnetOrder = parseOrder(
         signed("DELETE", "/api/v3/order", mapOf("symbol" to normalizeMarketSymbol(symbol), "orderId" to orderId.toString()), apiKey, secret).asJsonObject)
 
     fun cancelOpenOrders(symbol: String, apiKey: String, secret: String): List<TestnetOrder> = parseOrders(
         signed("DELETE", "/api/v3/openOrders", mapOf("symbol" to normalizeMarketSymbol(symbol)), apiKey, secret).asJsonArray)
+
+    fun openOrderLists(apiKey: String, secret: String): List<TestnetOrderList> =
+        signed("GET", "/api/v3/openOrderList", emptyMap(), apiKey, secret).asJsonArray.map { parseOrderList(it.asJsonObject) }
+            .sortedByDescending(TestnetOrderList::time)
+
+    fun cancelOrderList(symbol: String, orderListId: Long, apiKey: String, secret: String): TestnetOrderList =
+        parseOrderList(signed("DELETE", "/api/v3/orderList", mapOf("symbol" to normalizeMarketSymbol(symbol),
+            "orderListId" to orderListId.toString()), apiKey, secret).asJsonObject)
 
     fun tickerPrice(symbol: String): BigDecimal = JsonParser.parseString(request("GET", "/api/v3/ticker/price",
         mapOf("symbol" to normalizeMarketSymbol(symbol)))).asJsonObject.decimal("price")
@@ -183,11 +238,19 @@ class BinanceTestnetClient {
     private fun parseOrder(row: JsonObject): TestnetOrder {
         val executed = row.decimal("executedQty")
         val cumulative = row.get("cummulativeQuoteQty")?.asString?.toBigDecimalOrNull() ?: BigDecimal.ZERO
+        val rawType = row.get("type")?.asString ?: "LIMIT"
         return TestnetOrder(row.get("orderId").asLong, row.get("symbol").asString,
-            PaperOrderSide.valueOf(row.get("side").asString), parseType(row.get("type").asString), row.decimal("origQty"), executed,
+            PaperOrderSide.valueOf(row.get("side").asString), parseType(rawType), row.decimal("origQty"), executed,
             row.decimal("price"), cumulative.takeIf { executed.signum() > 0 }?.divide(executed, 16, java.math.RoundingMode.HALF_UP)?.stripTrailingZeros(),
-            row.get("status").asString, row.get("updateTime")?.asLong ?: row.get("transactTime")?.asLong ?: row.get("time")?.asLong ?: System.currentTimeMillis())
+            row.get("status").asString, row.get("updateTime")?.asLong ?: row.get("transactTime")?.asLong ?: row.get("time")?.asLong ?: System.currentTimeMillis(),
+            rawType, row.decimal("stopPrice"), row.get("orderListId")?.asLong ?: -1, row.get("clientOrderId")?.asString.orEmpty())
     }
+    private fun parseOrderList(row: JsonObject): TestnetOrderList = TestnetOrderList(
+        row.get("orderListId").asLong, row.get("symbol").asString, row.get("contingencyType")?.asString ?: "OCO",
+        row.get("listOrderStatus")?.asString ?: row.get("listStatusType")?.asString ?: "EXECUTING",
+        row.get("listClientOrderId")?.asString.orEmpty(),
+        row.get("transactionTime")?.asLong ?: row.get("time")?.asLong ?: System.currentTimeMillis(),
+        row.getAsJsonArray("orders")?.mapNotNull { it.asJsonObject.get("orderId")?.asLong } ?: emptyList())
     private fun parseType(value: String) = if (value.startsWith("MARKET")) PaperOrderType.MARKET else PaperOrderType.LIMIT
 
     companion object {

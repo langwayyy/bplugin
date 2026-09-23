@@ -240,6 +240,22 @@ class CryptoChartCanvas(private val watermark: Boolean = false) : JComponent() {
             drawAverage(5, JBColor(0xD08A22, 0xF2B84B))
             drawAverage(10, JBColor(0x5479B8, 0x83A9E8))
             drawAverage(20, JBColor(0x8B5FA8, 0xBE8CDB))
+            if (!watermark && s.tradingMode == TradingAccountMode.TESTNET.name) {
+                val orders = CryptoTestnetTradingService.getInstance().snapshot.openOrders.filter { it.symbol == s.selected }
+                val lines = orders.flatMap { order -> buildList {
+                    order.price.takeIf { it.signum() > 0 }?.let { add(Triple(it.toDouble(), "委托 #${order.id}", false)) }
+                    order.stopPrice.takeIf { it.signum() > 0 }?.let { add(Triple(it.toDouble(), "触发 #${order.id}", true)) }
+                } }.distinctBy { "${it.first}:${it.second}" }
+                lines.forEach { (value, label, trigger) ->
+                    if (value in low..high) {
+                        val lineY = y(value)
+                        g.color = if (trigger) JBColor(0xC54B4B, 0xFF7373) else JBColor(0x3B78B4, 0x75AADB)
+                        g.stroke = BasicStroke(1.2f, BasicStroke.CAP_BUTT, BasicStroke.JOIN_MITER, 1f, floatArrayOf(5f, 4f), 0f)
+                        g.drawLine(12, lineY, plotWidth + 12, lineY)
+                        g.drawString("$label ${price(value)}", 16, (lineY - 3).coerceAtLeast(top + 10))
+                    }
+                }
+            }
             if (!watermark) crosshair?.let { point ->
                 if (point.x in 12..(plotWidth + 12) && point.y in top..(top + plotHeight)) {
                     val index = (((point.x - 12) / stride).toInt()).coerceIn(0, bars.lastIndex)

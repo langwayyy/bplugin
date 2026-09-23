@@ -23,9 +23,16 @@ import java.util.concurrent.CompletionStage
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 
 enum class TradingAccountMode(val label: String) {
     LOCAL("本地模拟"), TESTNET("币安测试网");
+    override fun toString() = label
+}
+
+enum class TestnetOrderKind(val label: String) {
+    MARKET("市价"), LIMIT("限价"), STOP_LOSS_LIMIT("止损限价"), TAKE_PROFIT_LIMIT("止盈限价"), OCO("OCO 止盈止损");
     override fun toString() = label
 }
 
@@ -34,6 +41,7 @@ data class TestnetSnapshot(
     val openOrders: List<TestnetOrder> = emptyList(),
     val history: List<TestnetOrder> = emptyList(),
     val trades: List<TestnetTrade> = emptyList(),
+    val orderLists: List<TestnetOrderList> = emptyList(),
     val updatedAt: Instant? = null,
 )
 
@@ -53,6 +61,7 @@ data class TestnetExecutionEvent(
     val cumulativeQuoteQuantity: BigDecimal,
     val time: Long,
 )
+data class TestnetOrderListEvent(val orderListId: Long, val status: String, val time: Long)
 
 object BinanceTestnetCredentials {
     private val attributes = CredentialAttributes("QuietCrypto.BinanceSpotTestnet.Secret")
@@ -77,6 +86,7 @@ class CryptoTestnetTradingService : Disposable {
     @Volatile private var lastOrderAt = 0L
     private val stream = BinanceTestnetUserStream(
         onEvent = { event -> if (event == null || !applyExecutionEvent(event)) refresh(pendingSymbol) },
+        onListEvent = { event -> if (!applyOrderListEvent(event)) refresh(pendingSymbol) },
         onState = { connected, message ->
             streamConnected = connected; streamMessage = message
             if (!connected) retryAt = System.currentTimeMillis() + 15_000
@@ -125,7 +135,8 @@ class CryptoTestnetTradingService : Disposable {
                 val orders = client.openOrders(credentials.first, credentials.second)
                 val history = pendingSymbol?.let { client.allOrders(it, credentials.first, credentials.second) }.orEmpty()
                 val trades = pendingSymbol?.let { client.trades(it, credentials.first, credentials.second) }.orEmpty()
-                TestnetSnapshot(balances, orders, history.filter { it.status !in setOf("NEW", "PARTIALLY_FILLED") }, trades, Instant.now())
+                val orderLists = client.openOrderLists(credentials.first, credentials.second)
+                TestnetSnapshot(balances, orders, history.filter { it.status !in setOf("NEW", "PARTIALLY_FILLED") }, trades, orderLists, Instant.now())
             }
             result.onSuccess { snapshot = it; error = null; retryAt = 0; nextRefresh = System.currentTimeMillis() + 30_000 }
                 .onFailure { error = it.message ?: "测试网账户同步失败"; retryAt = System.currentTimeMillis() + 15_000 }
@@ -152,7 +163,7 @@ class CryptoTestnetTradingService : Disposable {
                 val now = System.currentTimeMillis()
                 if (fingerprint == lastOrderFingerprint && now - lastOrderAt < 5_000) error("检测到重复订单，请稍后重试")
                 lastOrderFingerprint = fingerprint; lastOrderAt = now
-                client.placeOrder(symbol, side, type, quantity, price, credentials.first, credentials.second)
+                client.placeOrder(symbol, side, type, quantity, price, credentials.first, credentials.second, clientId("ord", fingerprint))
             }
             busy.set(false)
             result.onSuccess { refresh(symbol) }.onFailure { error = it.message }
@@ -167,6 +178,64 @@ class CryptoTestnetTradingService : Disposable {
             val result = runCatching { client.cancelOrder(order.symbol, order.id, credentials.first, credentials.second) }
             busy.set(false)
             result.onSuccess { refresh(order.symbol) }.onFailure { error = it.message }
+            ApplicationManager.getApplication().invokeLater { callback(result) }
+        }
+    }
+
+    fun placeConditional(symbol: String, side: PaperOrderSide, kind: TestnetOrderKind, quantity: BigDecimal,
+                         triggerPrice: BigDecimal, limitPrice: BigDecimal, callback: (Result<TestnetOrder>) -> Unit) {
+        val credentials = credentials() ?: return callback(Result.failure(IllegalStateException("请先配置测试网凭据")))
+        if (kind !in setOf(TestnetOrderKind.STOP_LOSS_LIMIT, TestnetOrderKind.TAKE_PROFIT_LIMIT))
+            return callback(Result.failure(IllegalArgumentException("条件订单类型无效")))
+        if (!busy.compareAndSet(false, true)) return callback(Result.failure(IllegalStateException("测试网请求正在处理中")))
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val result = runCatching {
+                requireFreshSnapshot()
+                val current = client.tickerPrice(symbol)
+                validateConditionalTrigger(kind, side, triggerPrice, current)?.let { error(it) }
+                val rules = client.rules(symbol)
+                rules.validate(quantity, limitPrice)?.let { error(it) }
+                rules.validate(quantity, triggerPrice)?.let { error("触发价：$it") }
+                validateRisk(symbol, side, quantity, limitPrice, current)
+                val fingerprint = "${normalizeMarketSymbol(symbol)}|$side|$kind|$quantity|$triggerPrice|$limitPrice"
+                ensureUnique(fingerprint)
+                client.placeConditionalOrder(symbol, side, kind.name, quantity, triggerPrice, limitPrice,
+                    clientId("ord", fingerprint), credentials.first, credentials.second)
+            }
+            busy.set(false); result.onSuccess { refresh(symbol) }.onFailure { error = it.message }
+            ApplicationManager.getApplication().invokeLater { callback(result) }
+        }
+    }
+
+    fun placeOco(symbol: String, side: PaperOrderSide, quantity: BigDecimal, targetPrice: BigDecimal,
+                 stopPrice: BigDecimal, stopLimitPrice: BigDecimal, callback: (Result<TestnetOrderList>) -> Unit) {
+        val credentials = credentials() ?: return callback(Result.failure(IllegalStateException("请先配置测试网凭据")))
+        if (!busy.compareAndSet(false, true)) return callback(Result.failure(IllegalStateException("测试网请求正在处理中")))
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val result = runCatching {
+                requireFreshSnapshot()
+                val current = client.tickerPrice(symbol)
+                validateOcoPrices(side, current, targetPrice, stopPrice, stopLimitPrice)?.let { error(it) }
+                val rules = client.rules(symbol)
+                listOf(targetPrice, stopPrice, stopLimitPrice).forEach { value -> rules.validate(quantity, value)?.let { error(it) } }
+                val riskPrice = if (side == PaperOrderSide.BUY) maxOf(targetPrice, stopLimitPrice) else current
+                validateRisk(symbol, side, quantity, riskPrice, current)
+                val fingerprint = "${normalizeMarketSymbol(symbol)}|$side|OCO|$quantity|$targetPrice|$stopPrice|$stopLimitPrice"
+                ensureUnique(fingerprint)
+                client.placeOco(symbol, side, quantity, targetPrice, stopPrice, stopLimitPrice,
+                    clientId("list", fingerprint), credentials.first, credentials.second)
+            }
+            busy.set(false); result.onSuccess { refresh(symbol) }.onFailure { error = it.message }
+            ApplicationManager.getApplication().invokeLater { callback(result) }
+        }
+    }
+
+    fun cancelOrderList(orderList: TestnetOrderList, callback: (Result<TestnetOrderList>) -> Unit) {
+        val credentials = credentials() ?: return callback(Result.failure(IllegalStateException("请先配置测试网凭据")))
+        if (!busy.compareAndSet(false, true)) return callback(Result.failure(IllegalStateException("测试网请求正在处理中")))
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val result = runCatching { client.cancelOrderList(orderList.symbol, orderList.id, credentials.first, credentials.second) }
+            busy.set(false); result.onSuccess { refresh(orderList.symbol) }.onFailure { error = it.message }
             ApplicationManager.getApplication().invokeLater { callback(result) }
         }
     }
@@ -220,6 +289,36 @@ class CryptoTestnetTradingService : Disposable {
         )
         return true
     }
+    @Synchronized private fun applyOrderListEvent(event: TestnetOrderListEvent): Boolean {
+        val existing = snapshot.orderLists.firstOrNull { it.id == event.orderListId } ?: return false
+        val updated = existing.copy(status = event.status, time = event.time)
+        snapshot = snapshot.copy(orderLists = if (event.status in setOf("ALL_DONE", "REJECT"))
+            snapshot.orderLists.filterNot { it.id == event.orderListId }
+        else snapshot.orderLists.map { if (it.id == event.orderListId) updated else it })
+        return true
+    }
+
+    private fun requireFreshSnapshot() {
+        val updated = snapshot.updatedAt ?: error("账户尚未完成同步")
+        if (updated.plusSeconds(60).isBefore(Instant.now())) error("账户数据已超过 60 秒，请先同步账户")
+    }
+    private fun validateRisk(symbol: String, side: PaperOrderSide, quantity: BigDecimal, orderPrice: BigDecimal, current: BigDecimal) {
+        val settings = CryptoSettings.getInstance().state
+        validateTestnetRisk(symbol, side, quantity, orderPrice, current, snapshot.balances,
+            TestnetRiskPolicy(settings.testnetMaxOrderPercent, settings.testnetMaxOrderNotional.toBigDecimal(),
+                settings.testnetMaxPriceDeviationPercent))?.let { error(it) }
+    }
+    private fun ensureUnique(fingerprint: String) {
+        val now = System.currentTimeMillis()
+        if (fingerprint == lastOrderFingerprint && now - lastOrderAt < 5_000) error("检测到重复订单，请稍后重试")
+        lastOrderFingerprint = fingerprint; lastOrderAt = now
+    }
+    private fun clientId(prefix: String, fingerprint: String): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(fingerprint.toByteArray(StandardCharsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }.take(16)
+        val minute = (System.currentTimeMillis() / 60_000).toString(36)
+        return "qc-$prefix-$digest-$minute".take(36)
+    }
 
     private fun credentials(): Pair<String, String>? {
         val key = CryptoSettings.getInstance().state.testnetApiKey.trim()
@@ -242,6 +341,7 @@ class CryptoTestnetTradingService : Disposable {
 /** Signed Spot Testnet user-data subscription. Events are followed by a REST state reconciliation. */
 internal class BinanceTestnetUserStream(
     private val onEvent: (TestnetExecutionEvent?) -> Unit,
+    private val onListEvent: (TestnetOrderListEvent) -> Unit,
     private val onState: (Boolean, String?) -> Unit,
 ) : AutoCloseable {
     private val http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).apply {
@@ -306,13 +406,18 @@ internal class BinanceTestnetUserStream(
                     }
                     else if (root?.has("event") == true || root?.has("subscriptionId") == true) {
                         onState(true, null)
-                        val event = root.getAsJsonObject("event")?.takeIf { it.get("e")?.asString == "executionReport" }?.let {
+                        val payload = root.getAsJsonObject("event")
+                        val event = payload?.takeIf { it.get("e")?.asString == "executionReport" }?.let {
                             TestnetExecutionEvent(it.get("i").asLong, it.get("s").asString, it.get("X").asString,
                                 it.get("z")?.asString?.toBigDecimalOrNull() ?: BigDecimal.ZERO,
                                 it.get("Z")?.asString?.toBigDecimalOrNull() ?: BigDecimal.ZERO,
                                 it.get("E")?.asLong ?: System.currentTimeMillis())
                         }
-                        onEvent(event)
+                        val listEvent = payload?.takeIf { it.get("e")?.asString == "listStatus" }?.let {
+                            TestnetOrderListEvent(it.get("g").asLong, it.get("L")?.asString ?: it.get("l")?.asString ?: "EXECUTING",
+                                it.get("E")?.asLong ?: System.currentTimeMillis())
+                        }
+                        if (listEvent != null) onListEvent(listEvent) else onEvent(event)
                     }
                 }
             }

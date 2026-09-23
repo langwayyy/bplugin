@@ -13,6 +13,23 @@ data class TestnetPerformance(
 
 data class TestnetRiskPolicy(val maxPositionPercent: Int, val maxNotional: BigDecimal, val maxPriceDeviationPercent: Int)
 
+internal fun validateConditionalTrigger(kind: TestnetOrderKind, side: PaperOrderSide, trigger: BigDecimal,
+                                        current: BigDecimal): String? {
+    val above = (kind == TestnetOrderKind.STOP_LOSS_LIMIT && side == PaperOrderSide.BUY) ||
+        (kind == TestnetOrderKind.TAKE_PROFIT_LIMIT && side == PaperOrderSide.SELL)
+    return if (if (above) trigger > current else trigger < current) null
+    else "${kind.label}${side.label}触发价应${if (above) "高于" else "低于"}市场价 ${marketPrice(current)}"
+}
+
+internal fun validateOcoPrices(side: PaperOrderSide, current: BigDecimal, target: BigDecimal,
+                               stop: BigDecimal, stopLimit: BigDecimal): String? = when {
+    side == PaperOrderSide.SELL && !(target > current && current > stop) -> "卖出 OCO 需要：目标价 > 市场价 > 止损触发价"
+    side == PaperOrderSide.BUY && !(target < current && current < stop) -> "买入 OCO 需要：目标价 < 市场价 < 止损触发价"
+    side == PaperOrderSide.SELL && stopLimit > stop -> "卖出 OCO 的止损限价不能高于触发价"
+    side == PaperOrderSide.BUY && stopLimit < stop -> "买入 OCO 的止损限价不能低于触发价"
+    else -> null
+}
+
 internal fun validateTestnetRisk(symbol: String, side: PaperOrderSide, quantity: BigDecimal, orderPrice: BigDecimal,
                                  currentPrice: BigDecimal, balances: List<TestnetBalance>, policy: TestnetRiskPolicy): String? {
     val normalized = normalizeMarketSymbol(symbol)

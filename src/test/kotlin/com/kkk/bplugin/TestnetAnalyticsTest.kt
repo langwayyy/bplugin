@@ -31,6 +31,17 @@ class TestnetAnalyticsTest : TestCase() {
             balances, TestnetRiskPolicy(100, BigDecimal("1000"), 5)))
     }
 
+    fun testConditionalAndOcoPriceDirections() {
+        val current = BigDecimal("100")
+        assertNull(validateConditionalTrigger(TestnetOrderKind.STOP_LOSS_LIMIT, PaperOrderSide.SELL, BigDecimal("95"), current))
+        assertNotNull(validateConditionalTrigger(TestnetOrderKind.STOP_LOSS_LIMIT, PaperOrderSide.SELL, BigDecimal("105"), current))
+        assertNull(validateConditionalTrigger(TestnetOrderKind.TAKE_PROFIT_LIMIT, PaperOrderSide.SELL, BigDecimal("110"), current))
+        assertNull(validateOcoPrices(PaperOrderSide.SELL, current, BigDecimal("110"), BigDecimal("95"), BigDecimal("94")))
+        assertNotNull(validateOcoPrices(PaperOrderSide.SELL, current, BigDecimal("90"), BigDecimal("95"), BigDecimal("94")))
+        assertNotNull(validateOcoPrices(PaperOrderSide.SELL, current, BigDecimal("110"), BigDecimal("95"), BigDecimal("96")))
+        assertNull(validateOcoPrices(PaperOrderSide.BUY, current, BigDecimal("90"), BigDecimal("105"), BigDecimal("106")))
+    }
+
     fun testEquitySkipsAssetsWithoutUsdtPrice() {
         val balances = listOf(TestnetBalance("USDT", BigDecimal("100"), BigDecimal("5")),
             TestnetBalance("BTC", BigDecimal("0.1"), BigDecimal.ZERO), TestnetBalance("UNKNOWN", BigDecimal.TEN, BigDecimal.ZERO))
