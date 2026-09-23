@@ -64,4 +64,28 @@ class CryptoPaperTradingTest : TestCase() {
         assertFalse(book.place("BTCUSDT", PaperOrderSide.BUY, PaperOrderType.MARKET,
             BigDecimal.ONE, null, null).accepted)
     }
+
+    fun testSellOcoFillsOneLegAndCancelsSibling() {
+        val book = PaperTradingBook(PaperAccount(), feeBps = 0, slippageBps = 0)
+        book.place("BTCUSDT", PaperOrderSide.BUY, PaperOrderType.MARKET, BigDecimal.ONE, null, BigDecimal("100"))
+        val result = book.placeOco("BTCUSDT", PaperOrderSide.SELL, BigDecimal.ONE,
+            BigDecimal("110"), BigDecimal("95"), BigDecimal("94"), BigDecimal("100"))
+        assertTrue(result.accepted)
+        assertEquals(0, BigDecimal.ZERO.compareTo(book.availableQuantity("BTCUSDT")))
+        assertTrue(book.onPrice("BTCUSDT", BigDecimal("111")))
+        val group = book.account.orders.filter { it.ocoGroupId == result.order!!.ocoGroupId }
+        assertEquals(1, group.count { it.status == PaperOrderStatus.FILLED })
+        assertEquals(1, group.count { it.status == PaperOrderStatus.CANCELLED })
+        assertTrue(book.account.positions.isEmpty())
+    }
+
+    fun testCancellingOcoCancelsBothLegsAndReleasesPosition() {
+        val book = PaperTradingBook(PaperAccount(), feeBps = 0, slippageBps = 0)
+        book.place("BTCUSDT", PaperOrderSide.BUY, PaperOrderType.MARKET, BigDecimal.ONE, null, BigDecimal("100"))
+        val order = book.placeOco("BTCUSDT", PaperOrderSide.SELL, BigDecimal.ONE,
+            BigDecimal("110"), BigDecimal("95"), BigDecimal("94"), BigDecimal("100")).order!!
+        assertTrue(book.cancel(order.id))
+        assertEquals(2, book.account.orders.count { it.ocoGroupId == order.ocoGroupId && it.status == PaperOrderStatus.CANCELLED })
+        assertEquals(0, BigDecimal.ONE.compareTo(book.availableQuantity("BTCUSDT")))
+    }
 }

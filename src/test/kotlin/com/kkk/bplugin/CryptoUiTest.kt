@@ -13,6 +13,22 @@ import javax.swing.JComponent
 
 /** Exercises real IntelliJ services and Swing construction without network requests. */
 class CryptoUiTest : BasePlatformTestCase() {
+    fun testStrategyExportRoundTripExcludesCredentialsAndRuntime() {
+        val service = CryptoStrategyService.getInstance()
+        val before = service.state.copy()
+        val settings = CryptoSettings.getInstance()
+        val oldKey = settings.state.testnetApiKey
+        try {
+            service.loadState(CryptoStrategyService.StoredState())
+            service.save(CryptoStrategyRule(name = "export-test", symbol = "BTCUSDT", condition = StrategyCondition.PRICE_ABOVE, threshold = BigDecimal("100")))
+            settings.state.testnetApiKey = "must-not-export"
+            val json = service.exportRules()
+            assertTrue(json.contains("export-test")); assertFalse(json.contains("must-not-export")); assertFalse(json.contains("executionsToday"))
+            service.loadState(CryptoStrategyService.StoredState())
+            assertEquals(1, service.importRules(json).getOrThrow())
+            assertEquals("export-test", service.strategies().single().name)
+        } finally { settings.state.testnetApiKey = oldKey; service.loadState(before) }
+    }
     fun testChartCloseButtonEscapeAndReopenReleaseViewers() {
         verifyChartCloseLifecycle()
     }

@@ -15,10 +15,14 @@ import com.intellij.util.ui.FormBuilder
 import com.intellij.util.ui.JBUI
 import java.awt.BorderLayout
 import java.awt.FlowLayout
+import java.awt.GridLayout
 import java.math.BigDecimal
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.awt.Toolkit
+import java.awt.datatransfer.DataFlavor
+import java.awt.datatransfer.StringSelection
 import javax.swing.*
 import javax.swing.table.AbstractTableModel
 
@@ -39,11 +43,12 @@ class CryptoStrategyPanel(private val project: Project?) : JPanel(BorderLayout(0
     private var rules = emptyList<CryptoStrategyRule>()
     private var logs = emptyList<StrategyLogEntry>()
     private var drafts = emptyList<StrategyOrderDraft>()
+    private var executions = emptyList<StrategyExecution>()
     private var fingerprint = ""
     private val ruleModel = object : AbstractTableModel() {
         override fun getRowCount() = rules.size
-        override fun getColumnCount() = 9
-        override fun getColumnName(column: Int) = arrayOf("启用", "名称", "交易对", "触发条件", "动作", "订单模板", "预算 USDT", "冷却", "每日上限")[column]
+        override fun getColumnCount() = 12
+        override fun getColumnName(column: Int) = arrayOf("启用", "名称", "交易对", "触发条件", "动作", "订单模板", "预算 USDT", "冷却", "每日上限", "最后检查", "最后触发", "今日执行")[column]
         override fun getValueAt(row: Int, column: Int): Any {
             val it = rules[row]
             return when (column) {
@@ -55,18 +60,21 @@ class CryptoStrategyPanel(private val project: Project?) : JPanel(BorderLayout(0
                 5 -> it.orderTemplate.label
                 6 -> marketPrice(it.budgetUsdt, 2)
                 7 -> "${it.cooldownMinutes} 分钟"
-                else -> "${it.maxExecutionsPerDay} 次"
+                8 -> "${it.maxExecutionsPerDay} 次"
+                9 -> service.lastChecked(it.symbol)?.let(::time) ?: "—"
+                10 -> service.runtime(it.id)?.lastTriggeredAt?.takeIf { value -> value > 0 }?.let(::time) ?: "—"
+                else -> service.runtime(it.id)?.takeIf { runtime -> runtime.executionDate == java.time.LocalDate.now().toString() }?.executionsToday ?: 0
             }
         }
     }
     private val logModel = object : AbstractTableModel() {
         override fun getRowCount() = logs.size
-        override fun getColumnCount() = 7
-        override fun getColumnName(column: Int) = arrayOf("时间", "策略", "交易对", "状态", "触发价", "说明", "订单 ID")[column]
+        override fun getColumnCount() = 8
+        override fun getColumnName(column: Int) = arrayOf("时间", "策略", "交易对", "状态", "触发价", "说明", "订单 ID", "执行 ID")[column]
         override fun getValueAt(row: Int, column: Int): Any {
             val it = logs[row]
             return when (column) { 0 -> time(it.time); 1 -> it.strategyName; 2 -> it.symbol; 3 -> it.status
-                4 -> marketPrice(it.price); 5 -> it.message; else -> it.orderId.ifBlank { "—" } }
+                4 -> marketPrice(it.price); 5 -> it.message; 6 -> it.orderId.ifBlank { "—" }; else -> it.executionId?.take(12) ?: "—" }
         }
     }
     private val draftModel = object : AbstractTableModel() {
@@ -79,24 +87,35 @@ class CryptoStrategyPanel(private val project: Project?) : JPanel(BorderLayout(0
                 4 -> it.rule.orderTemplate.label; 5 -> marketPrice(it.rule.budgetUsdt, 2); else -> marketPrice(it.price) }
         }
     }
+    private val executionModel = object : AbstractTableModel() {
+        override fun getRowCount() = executions.size
+        override fun getColumnCount() = 8
+        override fun getColumnName(column: Int) = arrayOf("时间", "执行 ID", "策略", "交易对", "状态", "客户端订单 ID", "订单 ID", "说明")[column]
+        override fun getValueAt(row: Int, column: Int): Any { val it = executions[row]; return when (column) {
+            0 -> time(it.createdAt); 1 -> it.id.take(12); 2 -> it.strategyName; 3 -> it.symbol; 4 -> it.state.name
+            5 -> it.clientOrderId.ifBlank { "—" }; 6 -> it.orderId.ifBlank { "—" }; else -> it.message } }
+    }
     private val ruleTable = table(ruleModel)
     private val logTable = table(logModel)
     private val draftTable = table(draftModel)
+    private val executionTable = table(executionModel)
     private val timer = Timer(1_000) { render() }
+    private val backtest = StrategyBacktestPanel(project)
 
     init {
         border = JBUI.Borders.empty(12); preferredSize = JBUI.size(1120, 650)
         add(JPanel(BorderLayout()).apply {
-            add(JPanel(FlowLayout(FlowLayout.LEFT)).apply {
-                add(status)
-                add(JButton("新建").apply { addActionListener { edit(null) } })
-                add(JButton("编辑").apply { addActionListener { selectedRule()?.let(::edit) ?: showHint("请先选择策略") } })
-                add(JButton("启用 / 停用").apply { addActionListener { selectedRule()?.let { service.toggle(it.id); render(true) } ?: showHint("请先选择策略") } })
-                add(JButton("删除").apply { addActionListener { removeSelected() } })
-                add(JButton("历史回放").apply { addActionListener { replaySelected() } })
-                add(JButton("全局暂停 / 恢复").apply { addActionListener { service.setPaused(!service.isPaused()); render(true) } })
-                add(JButton("自动测试网开关").apply { addActionListener { toggleAuto() } })
-                add(JButton("风控上限").apply { addActionListener { editLimits() } })
+            add(JPanel(GridLayout(0, 1)).apply {
+                add(JPanel(FlowLayout(FlowLayout.LEFT)).apply {
+                    add(status); add(JButton("新建").apply { addActionListener { edit(null) } }); add(JButton("编辑").apply { addActionListener { selectedRule()?.let(::edit) ?: showHint("请先选择策略") } })
+                    add(JButton("启用 / 停用").apply { addActionListener { selectedRule()?.let { service.toggle(it.id); render(true) } ?: showHint("请先选择策略") } }); add(JButton("删除").apply { addActionListener { removeSelected() } })
+                    add(JButton("全局暂停 / 恢复").apply { addActionListener { service.setPaused(!service.isPaused()); render(true) } }); add(JButton("自动测试网开关").apply { addActionListener { toggleAuto() } })
+                })
+                add(JPanel(FlowLayout(FlowLayout.LEFT)).apply {
+                    add(JButton("历史回放").apply { addActionListener { replaySelected() } }); add(JButton("完整回测").apply { addActionListener { selectedRule()?.let { backtest.run(it) } ?: showHint("请先选择策略") } })
+                    add(JButton("参数对比").apply { addActionListener { selectedRule()?.let { backtest.compare(it) } ?: showHint("请先选择策略") } })
+                    add(JButton("风控上限").apply { addActionListener { editLimits() } }); add(JButton("导入").apply { addActionListener { importRules() } }); add(JButton("导出").apply { addActionListener { exportRules() } })
+                })
             }, BorderLayout.CENTER)
             add(hint, BorderLayout.SOUTH)
         }, BorderLayout.NORTH)
@@ -113,6 +132,8 @@ class CryptoStrategyPanel(private val project: Project?) : JPanel(BorderLayout(0
                     add(JButton("确认提交测试网").apply { addActionListener { confirmDraft() } })
                 }, BorderLayout.SOUTH)
             })
+            addTab("执行状态", JBScrollPane(executionTable))
+            addTab("回测报告", backtest)
         }, BorderLayout.CENTER)
         render(true)
     }
@@ -159,12 +180,23 @@ class CryptoStrategyPanel(private val project: Project?) : JPanel(BorderLayout(0
             service.confirmDraft(item.id); hint.text = "订单正在提交，结果会写入运行日志"; render(true)
         }
     }
+    private fun exportRules() {
+        Toolkit.getDefaultToolkit().systemClipboard.setContents(StringSelection(service.exportRules()), null)
+        hint.text = "已将 ${service.strategies().size} 条策略复制到剪贴板；不包含密钥、账户和日志"
+    }
+    private fun importRules() {
+        val text = runCatching { Toolkit.getDefaultToolkit().systemClipboard.getData(DataFlavor.stringFlavor)?.toString() }.getOrNull()
+        if (text.isNullOrBlank()) return showHint("剪贴板没有策略 JSON")
+        service.importRules(text).onSuccess { hint.text = "已导入 $it 条策略，自动测试网开关未被修改"; render(true) }
+            .onFailure { hint.text = "导入失败：${it.message}" }
+    }
     private fun render(force: Boolean = false) {
-        val nextRules = service.strategies(); val nextLogs = service.logs(); val nextDrafts = service.drafts()
-        val next = "$nextRules|${nextLogs.take(30)}|$nextDrafts|${service.isPaused()}|${service.isTestnetAutoEnabled()}|${service.limits()}"
+        service.reconcileTestnetExecutions()
+        val nextRules = service.strategies(); val nextLogs = service.logs(); val nextDrafts = service.drafts(); val nextExecutions = service.executions()
+        val next = "$nextRules|${nextLogs.take(30)}|$nextDrafts|${nextExecutions.take(30)}|${service.isPaused()}|${service.isTestnetAutoEnabled()}|${service.limits()}"
         if (!force && next == fingerprint) return
-        fingerprint = next; rules = nextRules; logs = nextLogs; drafts = nextDrafts
-        ruleModel.fireTableDataChanged(); logModel.fireTableDataChanged(); draftModel.fireTableDataChanged()
+        fingerprint = next; rules = nextRules; logs = nextLogs; drafts = nextDrafts; executions = nextExecutions
+        ruleModel.fireTableDataChanged(); logModel.fireTableDataChanged(); draftModel.fireTableDataChanged(); executionModel.fireTableDataChanged()
         val limits = service.limits()
         status.text = "${if (service.isPaused()) "已暂停" else "运行中"} · 自动测试网 ${if (service.isTestnetAutoEnabled()) "已开启" else "已关闭"} · 每日 ${limits.first} 次 · 未完成订单 ${limits.second} 个"
         status.foreground = if (service.isPaused()) JBColor(0xB05A00, 0xE6A04A) else JBColor(0x2A7D4F, 0x63C68B)

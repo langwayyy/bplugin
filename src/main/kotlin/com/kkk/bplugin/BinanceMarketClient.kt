@@ -57,6 +57,24 @@ class BinanceMarketClient {
         return parseKlines(get("/api/v3/klines?symbol=${URLEncoder.encode(symbol, Charsets.UTF_8)}&interval=$interval&limit=350"))
     }
 
+    fun historicalKlines(symbol: String, period: KlinePeriod, startTime: Long, endTime: Long): List<KlineBar> {
+        check(CryptoSettings.getInstance().state.enabled) { "请先在设置中启用币安行情" }
+        require(isCryptoSymbol(symbol) && startTime < endTime)
+        val result = mutableListOf<KlineBar>()
+        var cursor = startTime
+        while (cursor < endTime && result.size < 20_000) {
+            val path = "/api/v3/klines?symbol=${URLEncoder.encode(symbol, Charsets.UTF_8)}&interval=${period.binanceInterval()}&startTime=$cursor&endTime=$endTime&limit=1000"
+            val page = parseKlines(get(path)).filter { it.timestamp in startTime..endTime }
+            if (page.isEmpty()) break
+            result += page
+            val next = page.last().timestamp + 1
+            if (next <= cursor) break
+            cursor = next
+            if (page.size < 1000) break
+        }
+        return result.distinctBy(KlineBar::timestamp).sortedBy(KlineBar::timestamp)
+    }
+
     companion object {
         val shared = BinanceMarketClient()
         internal fun parseQuotes(json: String): List<CryptoQuote> = JsonParser.parseString(json).asJsonArray.map { element ->

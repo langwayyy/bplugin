@@ -54,12 +54,14 @@ class CryptoStrategyEngineTest {
     @Test fun `strategy and runtime state survive serialization`() {
         val item = rule().copy(name = "persisted", action = StrategyAction.TESTNET_DRAFT)
         val runtime = StrategyRuntime(previousMetric = "101", lastTriggeredAt = 1234, executionDate = "2026-09-23", executionsToday = 2)
+        val execution = StrategyExecution("exec", item.id, item.name, item.symbol, 1234, StrategyExecutionState.SUBMITTING)
         val service = CryptoStrategyService()
         service.loadState(CryptoStrategyService.StoredState(strategiesJson = Gson().toJson(listOf(item)),
-            runtimesJson = Gson().toJson(mapOf(item.id to runtime)), paused = true, testnetAutoEnabled = true))
+            runtimesJson = Gson().toJson(mapOf(item.id to runtime)), executionsJson = Gson().toJson(listOf(execution)), paused = true, testnetAutoEnabled = true))
         assertEquals(item, service.strategies().single())
         assertTrue(service.isPaused()); assertTrue(service.isTestnetAutoEnabled())
         val stored = service.state
         assertTrue(stored.strategiesJson.contains("persisted")); assertTrue(stored.runtimesJson.contains("1234"))
+        assertEquals(StrategyExecutionState.UNKNOWN, service.executions().single().state)
     }
 }

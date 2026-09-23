@@ -35,6 +35,9 @@ data class PaperOrder(
     val filledAt: Long? = null,
     val fillPrice: BigDecimal? = null,
     val fee: BigDecimal = ZERO,
+    val ocoGroupId: String = "",
+    val ocoRole: String = "",
+    val triggerPrice: BigDecimal? = null,
 )
 
 data class PaperAccount(
@@ -91,11 +94,32 @@ internal class PaperTradingBook(
         return PaperTradeResult(true, if (accepted.status == PaperOrderStatus.FILLED) "模拟订单已成交" else "模拟限价单已提交", accepted)
     }
 
+    fun placeOco(symbol: String, side: PaperOrderSide, quantity: BigDecimal, targetPrice: BigDecimal,
+                 stopPrice: BigDecimal, stopLimitPrice: BigDecimal, marketPrice: BigDecimal): PaperTradeResult {
+        val normalized = normalizeMarketSymbol(symbol)
+        if (!isCryptoSymbol(normalized) || !normalized.endsWith("USDT")) return rejected("模拟盘目前仅支持 USDT 现货交易对")
+        if (quantity.signum() <= 0 || listOf(targetPrice, stopPrice, stopLimitPrice, marketPrice).any { it.signum() <= 0 }) return rejected("OCO 数量和价格必须大于 0")
+        val valid = if (side == PaperOrderSide.SELL) targetPrice > marketPrice && stopPrice < marketPrice && stopLimitPrice <= stopPrice
+            else targetPrice < marketPrice && stopPrice > marketPrice && stopLimitPrice >= stopPrice
+        if (!valid) return rejected(if (side == PaperOrderSide.SELL) "卖出 OCO 需满足目标价 > 市价 > 触发价 ≥ 止损限价" else "买入 OCO 需满足目标价 < 市价 < 触发价 ≤ 止损限价")
+        if (side == PaperOrderSide.SELL && quantity > availableQuantity(normalized)) return rejected("可卖数量不足，当前可用 ${marketPrice(availableQuantity(normalized))}")
+        if (side == PaperOrderSide.BUY && feeAdjusted(quantity * maxOf(targetPrice, stopLimitPrice), true) > availableCash()) return rejected("可用 USDT 不足")
+        val group = UUID.randomUUID().toString()
+        val target = PaperOrder(symbol = normalized, side = side, type = PaperOrderType.LIMIT, quantity = quantity.stripTrailingZeros(),
+            limitPrice = targetPrice.stripTrailingZeros(), ocoGroupId = group, ocoRole = "TARGET")
+        val stop = PaperOrder(symbol = normalized, side = side, type = PaperOrderType.LIMIT, quantity = quantity.stripTrailingZeros(),
+            limitPrice = stopLimitPrice.stripTrailingZeros(), ocoGroupId = group, ocoRole = "STOP", triggerPrice = stopPrice.stripTrailingZeros())
+        account = account.copy(orders = (listOf(stop, target) + account.orders).take(500))
+        return PaperTradeResult(true, "模拟 OCO 已提交", target)
+    }
+
     fun onPrice(symbol: String, price: BigDecimal): Boolean {
         if (price.signum() <= 0) return false
-        val ids = account.orders.filter { order -> order.status == PaperOrderStatus.OPEN && order.symbol == symbol && order.type == PaperOrderType.LIMIT &&
-            if (order.side == PaperOrderSide.BUY) price <= order.limitPrice!! else price >= order.limitPrice!!
-        }.sortedBy(PaperOrder::createdAt).map(PaperOrder::id)
+        val ids = account.orders.filter { order -> order.status == PaperOrderStatus.OPEN && order.symbol == symbol && order.type == PaperOrderType.LIMIT && when (order.ocoRole) {
+            "STOP" -> if (order.side == PaperOrderSide.BUY) price >= order.triggerPrice!! else price <= order.triggerPrice!!
+            else -> if (order.side == PaperOrderSide.BUY) price <= order.limitPrice!! else price >= order.limitPrice!!
+        }}.sortedWith(compareByDescending<PaperOrder> { it.ocoRole == "STOP" }.thenBy(PaperOrder::createdAt))
+            .distinctBy { it.ocoGroupId.ifBlank { it.id } }.map(PaperOrder::id)
         ids.forEach { id ->
             val order = account.orders.first { it.id == id }
             val slipped = slipped(price, order.side)
@@ -107,19 +131,23 @@ internal class PaperTradingBook(
 
     fun cancel(id: String): Boolean {
         val target = account.orders.firstOrNull { it.id == id && it.status == PaperOrderStatus.OPEN } ?: return false
-        account = account.copy(orders = account.orders.map { if (it.id == target.id) it.copy(status = PaperOrderStatus.CANCELLED) else it })
+        account = account.copy(orders = account.orders.map { if (it.id == target.id || target.ocoGroupId.isNotBlank() && it.ocoGroupId == target.ocoGroupId && it.status == PaperOrderStatus.OPEN) it.copy(status = PaperOrderStatus.CANCELLED) else it })
         return true
     }
 
-    fun availableCash(): BigDecimal = account.orders.asSequence()
-        .filter { it.status == PaperOrderStatus.OPEN && it.side == PaperOrderSide.BUY }
-        .map { feeAdjusted(it.quantity.multiply(it.limitPrice!!), add = true) }
-        .fold(account.cash, BigDecimal::subtract).max(ZERO)
+    fun availableCash(): BigDecimal {
+        val open = account.orders.filter { it.status == PaperOrderStatus.OPEN && it.side == PaperOrderSide.BUY }
+        val regular = open.filter { it.ocoGroupId.isBlank() }.sumOf { feeAdjusted(it.quantity * it.limitPrice!!, true) }
+        val grouped = open.filter { it.ocoGroupId.isNotBlank() }.groupBy(PaperOrder::ocoGroupId).values
+            .sumOf { group -> group.maxOf { feeAdjusted(it.quantity * it.limitPrice!!, true) } }
+        return account.cash.subtract(regular + grouped).max(ZERO)
+    }
 
     fun availableQuantity(symbol: String): BigDecimal {
         val held = account.positions.firstOrNull { it.symbol == symbol }?.quantity ?: ZERO
-        val reserved = account.orders.asSequence().filter { it.status == PaperOrderStatus.OPEN && it.side == PaperOrderSide.SELL && it.symbol == symbol }
-            .map(PaperOrder::quantity).fold(ZERO, BigDecimal::add)
+        val open = account.orders.filter { it.status == PaperOrderStatus.OPEN && it.side == PaperOrderSide.SELL && it.symbol == symbol }
+        val reserved = open.filter { it.ocoGroupId.isBlank() }.sumOf(PaperOrder::quantity) +
+            open.filter { it.ocoGroupId.isNotBlank() }.groupBy(PaperOrder::ocoGroupId).values.sumOf { it.maxOf(PaperOrder::quantity) }
         return held.subtract(reserved).max(ZERO)
     }
 
@@ -162,7 +190,11 @@ internal class PaperTradingBook(
         val filled = order.copy(status = PaperOrderStatus.FILLED, filledAt = System.currentTimeMillis(),
             fillPrice = price.stripTrailingZeros(), fee = fee)
         account = account.copy(cash = cash.max(ZERO).stripTrailingZeros(), realizedPnl = realized.stripTrailingZeros(),
-            positions = positions.sortedBy(PaperPosition::symbol), orders = account.orders.map { if (it.id == id) filled else it })
+            positions = positions.sortedBy(PaperPosition::symbol), orders = account.orders.map {
+                when { it.id == id -> filled
+                    order.ocoGroupId.isNotBlank() && it.ocoGroupId == order.ocoGroupId && it.status == PaperOrderStatus.OPEN -> it.copy(status = PaperOrderStatus.CANCELLED)
+                    else -> it }
+            })
     }
 
     private fun slipped(price: BigDecimal, side: PaperOrderSide): BigDecimal {
@@ -207,6 +239,13 @@ class CryptoPaperTradingService : PersistentStateComponent<CryptoPaperTradingSer
         if (market.pair(normalized) == null && market.quotes[normalized] == null)
             return PaperTradeResult(false, "未知交易对，请先加载币安交易对目录")
         return book.place(normalized, side, type, quantity, limitPrice, marketPrice).also { if (it.accepted) save() }
+    }
+    @Synchronized fun placeOco(symbol: String, side: PaperOrderSide, quantity: BigDecimal, targetPrice: BigDecimal,
+                               stopPrice: BigDecimal, stopLimitPrice: BigDecimal, marketPrice: BigDecimal): PaperTradeResult {
+        val normalized = normalizeMarketSymbol(symbol)
+        val market = CryptoMarketService.getInstance()
+        if (market.pair(normalized) == null && market.quotes[normalized] == null) return PaperTradeResult(false, "未知交易对，请先加载币安交易对目录")
+        return book.placeOco(normalized, side, quantity, targetPrice, stopPrice, stopLimitPrice, marketPrice).also { if (it.accepted) save() }
     }
     @Synchronized fun cancel(id: String): Boolean = book.cancel(id).also { if (it) save() }
     @Synchronized fun onQuote(quote: CryptoQuote) { if (book.onPrice(quote.symbol, quote.price)) save() }

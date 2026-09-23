@@ -146,7 +146,7 @@ class CryptoTestnetTradingService : Disposable {
     }
 
     fun place(symbol: String, side: PaperOrderSide, type: PaperOrderType, quantity: java.math.BigDecimal,
-              price: java.math.BigDecimal?, callback: (Result<TestnetOrder>) -> Unit) {
+              price: java.math.BigDecimal?, callback: (Result<TestnetOrder>) -> Unit, requestedClientOrderId: String? = null) {
         val credentials = credentials() ?: return callback(Result.failure(IllegalStateException("请先配置测试网凭据")))
         if (!busy.compareAndSet(false, true)) return callback(Result.failure(IllegalStateException("测试网请求正在处理中")))
         ApplicationManager.getApplication().executeOnPooledThread {
@@ -164,7 +164,7 @@ class CryptoTestnetTradingService : Disposable {
                 val now = System.currentTimeMillis()
                 if (fingerprint == lastOrderFingerprint && now - lastOrderAt < 5_000) error("检测到重复订单，请稍后重试")
                 lastOrderFingerprint = fingerprint; lastOrderAt = now
-                client.placeOrder(symbol, side, type, quantity, price, credentials.first, credentials.second, clientId("ord", fingerprint))
+                client.placeOrder(symbol, side, type, quantity, price, credentials.first, credentials.second, requestedClientOrderId ?: clientId("ord", fingerprint))
             }
             busy.set(false)
             result.onSuccess { refresh(symbol) }.onFailure { error = it.message }
@@ -209,7 +209,8 @@ class CryptoTestnetTradingService : Disposable {
     }
 
     fun placeOco(symbol: String, side: PaperOrderSide, quantity: BigDecimal, targetPrice: BigDecimal,
-                 stopPrice: BigDecimal, stopLimitPrice: BigDecimal, callback: (Result<TestnetOrderList>) -> Unit) {
+                 stopPrice: BigDecimal, stopLimitPrice: BigDecimal, callback: (Result<TestnetOrderList>) -> Unit,
+                 requestedClientOrderId: String? = null) {
         val credentials = credentials() ?: return callback(Result.failure(IllegalStateException("请先配置测试网凭据")))
         if (!busy.compareAndSet(false, true)) return callback(Result.failure(IllegalStateException("测试网请求正在处理中")))
         ApplicationManager.getApplication().executeOnPooledThread {
@@ -224,7 +225,7 @@ class CryptoTestnetTradingService : Disposable {
                 val fingerprint = "${normalizeMarketSymbol(symbol)}|$side|OCO|$quantity|$targetPrice|$stopPrice|$stopLimitPrice"
                 ensureUnique(fingerprint)
                 client.placeOco(symbol, side, quantity, targetPrice, stopPrice, stopLimitPrice,
-                    clientId("list", fingerprint), credentials.first, credentials.second)
+                    requestedClientOrderId ?: clientId("list", fingerprint), credentials.first, credentials.second)
             }
             busy.set(false); result.onSuccess { refresh(symbol) }.onFailure { error = it.message }
             ApplicationManager.getApplication().invokeLater { callback(result) }

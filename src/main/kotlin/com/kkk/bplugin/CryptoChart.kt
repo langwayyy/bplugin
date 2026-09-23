@@ -252,6 +252,13 @@ class CryptoChartCanvas(private val watermark: Boolean = false) : JComponent() {
                     g.fillPolygon(intArrayOf(x, x - 5, x + 5), intArrayOf(markerY + 7, markerY, markerY), 3)
                     g.drawString("策", x + 7, markerY + 7)
                 }
+                StrategyBacktestStore.latest?.takeIf { it.rule.symbol == s.selected }?.trades
+                    ?.filter { it.time in bars.first().timestamp..bars.last().timestamp }?.takeLast(60)?.forEach { trade ->
+                        val index = bars.indices.minByOrNull { kotlin.math.abs(bars[it].timestamp - trade.time) } ?: return@forEach
+                        val x = 12 + ((index + 0.5) * stride).toInt(); val tradeY = y(trade.price.toDouble()).coerceIn(top, top + plotHeight)
+                        g.color = if (trade.side == PaperOrderSide.BUY) JBColor(0xD64242, 0xFF6B6B) else JBColor(0x2A9955, 0x62C985)
+                        g.fillOval(x - 4, tradeY - 4, 8, 8); g.drawString(if (trade.side == PaperOrderSide.BUY) "B" else "S", x + 6, tradeY + 4)
+                    }
             }
             if (!watermark && s.tradingMode == TradingAccountMode.TESTNET.name) {
                 val orders = CryptoTestnetTradingService.getInstance().snapshot.openOrders.filter { it.symbol == s.selected }

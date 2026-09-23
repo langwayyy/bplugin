@@ -11,6 +11,7 @@ import java.math.BigDecimal
 import java.math.RoundingMode
 import java.time.Instant
 import java.time.LocalDate
+import java.time.ZoneId
 import java.util.UUID
 
 enum class StrategyCondition(val label: String) {
@@ -66,13 +67,19 @@ data class StrategyLogEntry(
     val message: String,
     val price: BigDecimal,
     val orderId: String = "",
+    val executionId: String? = null,
 )
 data class StrategyOrderDraft(
     val id: String = UUID.randomUUID().toString(),
     val rule: CryptoStrategyRule,
     val price: BigDecimal,
     val createdAt: Long,
+    val executionId: String? = null,
 )
+enum class StrategyExecutionState { TRIGGERED, WAITING_CONFIRMATION, SUBMITTING, COMPLETED, FAILED, BLOCKED, UNKNOWN }
+data class StrategyExecution(val id: String, val strategyId: String, val strategyName: String, val symbol: String,
+                             val createdAt: Long, val state: StrategyExecutionState, val orderId: String = "", val message: String = "",
+                             val clientOrderId: String = "")
 data class StrategyEvaluation(val runtime: StrategyRuntime, val crossed: Boolean, val ready: Boolean, val reason: String? = null)
 
 internal object StrategyEvaluator {
@@ -97,7 +104,7 @@ internal object StrategyEvaluator {
             StrategyCondition.MA_CROSS_ABOVE -> before.previousFastAbove == false && fastAbove == true
             StrategyCondition.MA_CROSS_BELOW -> before.previousFastAbove == true && fastAbove == false
         }
-        val date = LocalDate.now().toString()
+        val date = now.atZone(ZoneId.systemDefault()).toLocalDate().toString()
         val count = if (before.executionDate == date) before.executionsToday else 0
         var next = before.copy(previousMetric = metric?.toPlainString(), previousFastAbove = fastAbove,
             executionDate = date, executionsToday = count)
@@ -117,9 +124,10 @@ internal object StrategyEvaluator {
 @Service(Service.Level.APP)
 @State(name = "QuietCryptoStrategies", storages = [Storage("quiet-crypto-strategies.xml")])
 class CryptoStrategyService : PersistentStateComponent<CryptoStrategyService.StoredState> {
+    data class StrategyExport(val version: Int = 1, val exportedAt: Long = System.currentTimeMillis(), val strategies: List<CryptoStrategyRule>)
     data class StoredState(
         var strategiesJson: String = "[]", var runtimesJson: String = "{}", var logsJson: String = "[]",
-        var draftsJson: String = "[]", var historyJson: String = "{}", var quoteTimesJson: String = "{}",
+        var draftsJson: String = "[]", var historyJson: String = "{}", var quoteTimesJson: String = "{}", var executionsJson: String = "[]",
         var paused: Boolean = false, var testnetAutoEnabled: Boolean = false,
         var globalMaxExecutionsPerDay: Int = 20, var maxOpenStrategyOrders: Int = 5,
     )
@@ -131,6 +139,8 @@ class CryptoStrategyService : PersistentStateComponent<CryptoStrategyService.Sto
     private var drafts = mutableListOf<StrategyOrderDraft>()
     private var history = mutableMapOf<String, MutableList<BigDecimal>>()
     private var quoteTimes = mutableMapOf<String, Long>()
+    private var executions = mutableListOf<StrategyExecution>()
+    private val recoveryRequested = mutableSetOf<String>()
 
     @Synchronized override fun getState(): StoredState = stored.apply { encode() }
     @Synchronized override fun loadState(state: StoredState) {
@@ -145,11 +155,36 @@ class CryptoStrategyService : PersistentStateComponent<CryptoStrategyService.Sto
         val rawHistory: Map<String, List<String>> = decodeMap(state.historyJson)
         history = rawHistory.mapValues { (_, values) -> values.mapNotNull(String::toBigDecimalOrNull).takeLast(100).toMutableList() }.toMutableMap()
         quoteTimes = decodeMap<Long>(state.quoteTimesJson).toMutableMap()
+        executions = decodeList<StrategyExecution>(state.executionsJson).map {
+            if (it.state == StrategyExecutionState.SUBMITTING) it.copy(state = StrategyExecutionState.UNKNOWN, message = "插件重启时订单结果未知，已阻止重复提交") else it
+        }.take(500).toMutableList()
     }
 
     @Synchronized fun strategies(): List<CryptoStrategyRule> = strategies.toList()
     @Synchronized fun logs(): List<StrategyLogEntry> = logs.toList()
     @Synchronized fun drafts(): List<StrategyOrderDraft> = drafts.toList()
+    @Synchronized fun executions(): List<StrategyExecution> = executions.toList()
+    @Synchronized fun runtime(id: String): StrategyRuntime? = runtimes[id]
+    @Synchronized fun lastChecked(symbol: String): Long? = quoteTimes[symbol]
+    @Synchronized fun reconcileTestnetExecutions() {
+        val trading = CryptoTestnetTradingService.getInstance()
+        val snapshot = trading.snapshot
+        val updated = executions.map { execution ->
+            if (execution.state !in setOf(StrategyExecutionState.SUBMITTING, StrategyExecutionState.UNKNOWN) || execution.clientOrderId.isBlank()) execution
+            else {
+                val order = (snapshot.openOrders + snapshot.history).firstOrNull { it.clientOrderId == execution.clientOrderId || it.clientOrderId.startsWith("${execution.clientOrderId}-") }
+                val list = snapshot.orderLists.firstOrNull { it.clientOrderId == execution.clientOrderId }
+                when {
+                    order != null -> execution.copy(state = StrategyExecutionState.COMPLETED, orderId = order.id.toString(), message = "已通过客户端订单 ID 恢复")
+                    list != null -> execution.copy(state = StrategyExecutionState.COMPLETED, orderId = list.id.toString(), message = "已通过客户端订单 ID 恢复 OCO")
+                    else -> execution
+                }
+            }
+        }.toMutableList()
+        if (updated != executions) { executions = updated; encode() }
+        if (trading.hasCredentials()) updated.filter { it.state == StrategyExecutionState.UNKNOWN && it.clientOrderId.isNotBlank() }
+            .map(StrategyExecution::symbol).distinct().filter(recoveryRequested::add).forEach(trading::refresh)
+    }
     @Synchronized fun isPaused() = stored.paused
     @Synchronized fun isTestnetAutoEnabled() = stored.testnetAutoEnabled
     @Synchronized fun setPaused(value: Boolean) { stored.paused = value; encode() }
@@ -178,6 +213,17 @@ class CryptoStrategyService : PersistentStateComponent<CryptoStrategyService.Sto
     @Synchronized fun discardDraft(id: String) { drafts.removeIf { it.id == id }; encode() }
 
     @Synchronized fun trackedSymbols(): List<String> = strategies.filter(CryptoStrategyRule::enabled).map(CryptoStrategyRule::symbol).distinct()
+    @Synchronized fun exportRules(): String = gson.toJson(StrategyExport(strategies = strategies))
+    @Synchronized fun importRules(json: String): Result<Int> = runCatching {
+        val bundle = gson.fromJson(json, StrategyExport::class.java) ?: error("策略文件为空")
+        require(bundle.version == 1) { "不支持的策略文件版本 ${bundle.version}" }
+        require(bundle.strategies.size <= 100) { "策略数量超过 100" }
+        val valid = bundle.strategies.filter { isCryptoSymbol(it.symbol) && it.budgetUsdt.signum() > 0 && it.fastWindow in 2..50 && it.slowWindow in 3..100 && it.fastWindow < it.slowWindow }
+        require(valid.size == bundle.strategies.size) { "策略文件包含无效参数" }
+        val existing = strategies.map(CryptoStrategyRule::id).toMutableSet()
+        val imported = valid.map { if (it.id in existing) it.copy(id = UUID.randomUUID().toString()) else it }.take(100 - strategies.size)
+        strategies.addAll(imported); encode(); CryptoMarketService.getInstance().refresh(); imported.size
+    }
 
     @Synchronized fun onQuote(quote: CryptoQuote) {
         if (quoteTimes[quote.symbol]?.let { quote.updatedAt.toEpochMilli() <= it } == true) return
@@ -191,8 +237,12 @@ class CryptoStrategyService : PersistentStateComponent<CryptoStrategyService.Sto
                 stored.paused, globalExecutions, stored.globalMaxExecutionsPerDay, quote.updatedAt)
             runtimes[rule.id] = result.runtime
             if (result.crossed) {
-                if (result.ready) { globalExecutions++; execute(rule, quote) }
-                else addLog(rule, quote, "跳过", result.reason.orEmpty())
+                val executionId = UUID.randomUUID().toString()
+                executions.add(0, StrategyExecution(executionId, rule.id, rule.name, rule.symbol, quote.updatedAt.toEpochMilli(),
+                    if (result.ready) StrategyExecutionState.TRIGGERED else StrategyExecutionState.BLOCKED, message = result.reason.orEmpty()))
+                executions = executions.take(500).toMutableList()
+                if (result.ready) { globalExecutions++; execute(rule, quote, executionId) }
+                else addLog(rule, quote, "跳过", result.reason.orEmpty(), executionId = executionId)
             }
         }
         encode()
@@ -201,7 +251,7 @@ class CryptoStrategyService : PersistentStateComponent<CryptoStrategyService.Sto
     @Synchronized fun confirmDraft(id: String) {
         val draft = drafts.firstOrNull { it.id == id } ?: return
         drafts.removeIf { it.id == id }
-        executeTestnet(draft.rule, draft.price, "草稿确认")
+        executeTestnet(draft.rule, draft.price, "草稿确认", draft.executionId ?: UUID.randomUUID().toString())
         encode()
     }
 
@@ -219,49 +269,63 @@ class CryptoStrategyService : PersistentStateComponent<CryptoStrategyService.Sto
         return count
     }
 
-    private fun execute(rule: CryptoStrategyRule, quote: CryptoQuote) {
+    private fun execute(rule: CryptoStrategyRule, quote: CryptoQuote, executionId: String) {
         when (rule.action) {
             StrategyAction.NOTIFY -> {
                 CryptoMarketService.getInstance().publishStrategyAlert(rule, quote)
-                addLog(rule, quote, "已触发", "条件成立，已显示本地提醒")
+                updateExecution(executionId, StrategyExecutionState.COMPLETED, "本地提醒已显示")
+                addLog(rule, quote, "已触发", "条件成立，已显示本地提醒", executionId = executionId)
             }
-            StrategyAction.PAPER -> executePaper(rule, quote)
-            StrategyAction.TESTNET_DRAFT -> createDraft(rule, quote, "已生成测试网草稿")
-            StrategyAction.TESTNET_AUTO -> if (stored.testnetAutoEnabled) executeTestnet(rule, quote.price, "自动执行")
-                else createDraft(rule, quote, "测试网自动交易未开启，已生成草稿")
+            StrategyAction.PAPER -> executePaper(rule, quote, executionId)
+            StrategyAction.TESTNET_DRAFT -> createDraft(rule, quote, "已生成测试网草稿", executionId)
+            StrategyAction.TESTNET_AUTO -> if (stored.testnetAutoEnabled) executeTestnet(rule, quote.price, "自动执行", executionId)
+                else createDraft(rule, quote, "测试网自动交易未开启，已生成草稿", executionId)
         }
     }
-    private fun executePaper(rule: CryptoStrategyRule, quote: CryptoQuote) {
+    private fun executePaper(rule: CryptoStrategyRule, quote: CryptoQuote, executionId: String) {
         val open = CryptoPaperTradingService.getInstance().account().orders.count { it.status == PaperOrderStatus.OPEN }
-        if (open >= stored.maxOpenStrategyOrders) return addLog(rule, quote, "跳过", "已达到最大未完成订单数")
-        if (rule.orderTemplate == StrategyOrderTemplate.OCO) return addLog(rule, quote, "失败", "本地模拟盘暂不支持 OCO")
+        if (open >= stored.maxOpenStrategyOrders) { updateExecution(executionId, StrategyExecutionState.BLOCKED, "已达到最大未完成订单数"); return addLog(rule, quote, "跳过", "已达到最大未完成订单数", executionId = executionId) }
         val quantity = rule.budgetUsdt.divide(quote.price, 16, RoundingMode.DOWN)
+        if (rule.orderTemplate == StrategyOrderTemplate.OCO) {
+            val target = if (rule.side == PaperOrderSide.SELL) percent(quote.price, rule.targetPercent) else percent(quote.price, -rule.targetPercent)
+            val stop = if (rule.side == PaperOrderSide.SELL) percent(quote.price, -rule.stopPercent) else percent(quote.price, rule.stopPercent)
+            val stopLimit = if (rule.side == PaperOrderSide.SELL) percent(stop, BigDecimal("-0.1")) else percent(stop, BigDecimal("0.1"))
+            val result = CryptoPaperTradingService.getInstance().placeOco(rule.symbol, rule.side, quantity, target, stop, stopLimit, quote.price)
+            updateExecution(executionId, if (result.accepted) StrategyExecutionState.COMPLETED else StrategyExecutionState.FAILED, result.message, result.order?.ocoGroupId.orEmpty())
+            return addLog(rule, quote, if (result.accepted) "已执行" else "失败", result.message, result.order?.ocoGroupId.orEmpty(), executionId)
+        }
         val type = if (rule.orderTemplate == StrategyOrderTemplate.MARKET) PaperOrderType.MARKET else PaperOrderType.LIMIT
         val limit = if (type == PaperOrderType.LIMIT) offsetPrice(quote.price, rule.limitOffsetPercent) else null
         val result = CryptoPaperTradingService.getInstance().place(rule.symbol, rule.side, type, quantity, limit, quote.price)
-        addLog(rule, quote, if (result.accepted) "已执行" else "失败", result.message, result.order?.id.orEmpty())
+        updateExecution(executionId, if (result.accepted) StrategyExecutionState.COMPLETED else StrategyExecutionState.FAILED, result.message, result.order?.id.orEmpty())
+        addLog(rule, quote, if (result.accepted) "已执行" else "失败", result.message, result.order?.id.orEmpty(), executionId)
     }
-    private fun createDraft(rule: CryptoStrategyRule, quote: CryptoQuote, message: String) {
-        drafts.add(0, StrategyOrderDraft(rule = rule, price = quote.price, createdAt = quote.updatedAt.toEpochMilli()))
+    private fun createDraft(rule: CryptoStrategyRule, quote: CryptoQuote, message: String, executionId: String) {
+        drafts.add(0, StrategyOrderDraft(rule = rule, price = quote.price, createdAt = quote.updatedAt.toEpochMilli(), executionId = executionId))
         drafts = drafts.distinctBy { "${it.rule.id}:${it.price}:${it.createdAt}" }.take(100).toMutableList()
-        addLog(rule, quote, "待确认", message)
+        updateExecution(executionId, StrategyExecutionState.WAITING_CONFIRMATION, message)
+        addLog(rule, quote, "待确认", message, executionId = executionId)
     }
-    private fun executeTestnet(rule: CryptoStrategyRule, price: BigDecimal, source: String) {
+    private fun executeTestnet(rule: CryptoStrategyRule, price: BigDecimal, source: String, executionId: String) {
         val quote = CryptoQuote(rule.symbol, price, BigDecimal.ZERO, price, price, BigDecimal.ZERO, Instant.now())
         val open = CryptoTestnetTradingService.getInstance().snapshot.openOrders.size
-        if (open >= stored.maxOpenStrategyOrders) return addLog(rule, quote, "跳过", "已达到最大未完成订单数")
+        if (open >= stored.maxOpenStrategyOrders) { updateExecution(executionId, StrategyExecutionState.BLOCKED, "已达到最大未完成订单数"); return addLog(rule, quote, "跳过", "已达到最大未完成订单数", executionId = executionId) }
+        val requestedClientId = "qc-s-${executionId.replace("-", "").take(26)}"
+        updateExecution(executionId, StrategyExecutionState.SUBMITTING, "$source：正在提交", clientOrderId = requestedClientId)
         val rawQuantity = rule.budgetUsdt.divide(price, 16, RoundingMode.DOWN)
         if (rule.orderTemplate == StrategyOrderTemplate.OCO) {
             val target = if (rule.side == PaperOrderSide.SELL) percent(price, rule.targetPercent) else percent(price, -rule.targetPercent)
             val stop = if (rule.side == PaperOrderSide.SELL) percent(price, -rule.stopPercent) else percent(price, rule.stopPercent)
             val stopLimit = if (rule.side == PaperOrderSide.SELL) percent(stop, BigDecimal("-0.1")) else percent(stop, BigDecimal("0.1"))
             CryptoTestnetTradingService.getInstance().prepareOco(rule.symbol, rawQuantity, target, stop, stopLimit) { prepared ->
-                prepared.onFailure { addLog(rule, quote, "失败", "$source：${it.message}") }
+                prepared.onFailure { updateExecution(executionId, StrategyExecutionState.FAILED, it.message.orEmpty()); addLog(rule, quote, "失败", "$source：${it.message}", executionId = executionId) }
                 prepared.onSuccess { draft ->
                     CryptoTestnetTradingService.getInstance().placeOco(rule.symbol, rule.side, draft.quantity,
-                        draft.targetPrice, draft.stopPrice, draft.stopLimitPrice) { result ->
-                        addLog(rule, quote, if (result.isSuccess) "已执行" else "失败", "$source：${result.fold({ "OCO 已提交" }, { it.message.orEmpty() })}", result.getOrNull()?.id?.toString().orEmpty())
-                    }
+                        draft.targetPrice, draft.stopPrice, draft.stopLimitPrice, callback = { result ->
+                        val orderId = result.getOrNull()?.id?.toString().orEmpty(); val message = result.fold({ "OCO 已提交" }, { it.message.orEmpty() })
+                        updateExecution(executionId, if (result.isSuccess) StrategyExecutionState.COMPLETED else StrategyExecutionState.FAILED, message, orderId)
+                        addLog(rule, quote, if (result.isSuccess) "已执行" else "失败", "$source：$message", orderId, executionId)
+                    }, requestedClientOrderId = requestedClientId)
                 }
             }
             return
@@ -269,21 +333,27 @@ class CryptoStrategyService : PersistentStateComponent<CryptoStrategyService.Sto
         val sizingType = if (rule.orderTemplate == StrategyOrderTemplate.MARKET) PaperOrderType.MARKET else PaperOrderType.LIMIT
         val limit = if (sizingType == PaperOrderType.LIMIT) offsetPrice(price, rule.limitOffsetPercent) else null
         CryptoTestnetTradingService.getInstance().prepareOrder(rule.symbol, rule.side, sizingType, rawQuantity, limit) { prepared ->
-            prepared.onFailure { addLog(rule, quote, "失败", "$source：${it.message}") }
+            prepared.onFailure { updateExecution(executionId, StrategyExecutionState.FAILED, it.message.orEmpty()); addLog(rule, quote, "失败", "$source：${it.message}", executionId = executionId) }
             prepared.onSuccess { draft ->
                 when (rule.orderTemplate) {
                     StrategyOrderTemplate.MARKET, StrategyOrderTemplate.LIMIT -> CryptoTestnetTradingService.getInstance().place(
-                        rule.symbol, rule.side, sizingType, draft.quantity, draft.price) { result ->
-                        addLog(rule, quote, if (result.isSuccess) "已执行" else "失败", "$source：${result.fold({ "订单已提交" }, { it.message.orEmpty() })}", result.getOrNull()?.id?.toString().orEmpty())
-                    }
+                        rule.symbol, rule.side, sizingType, draft.quantity, draft.price, callback = { result ->
+                        val orderId = result.getOrNull()?.id?.toString().orEmpty(); val message = result.fold({ "订单已提交" }, { it.message.orEmpty() })
+                        updateExecution(executionId, if (result.isSuccess) StrategyExecutionState.COMPLETED else StrategyExecutionState.FAILED, message, orderId)
+                        addLog(rule, quote, if (result.isSuccess) "已执行" else "失败", "$source：$message", orderId, executionId)
+                    }, requestedClientOrderId = requestedClientId)
                     StrategyOrderTemplate.OCO -> Unit
                 }
             }
         }
     }
-    @Synchronized private fun addLog(rule: CryptoStrategyRule, quote: CryptoQuote, status: String, message: String, orderId: String = "") {
+    @Synchronized private fun updateExecution(id: String, state: StrategyExecutionState, message: String, orderId: String = "", clientOrderId: String = "") {
+        executions = executions.map { if (it.id == id) it.copy(state = state, message = message, orderId = orderId.ifBlank { it.orderId },
+            clientOrderId = clientOrderId.ifBlank { it.clientOrderId }) else it }.toMutableList(); encode()
+    }
+    @Synchronized private fun addLog(rule: CryptoStrategyRule, quote: CryptoQuote, status: String, message: String, orderId: String = "", executionId: String? = null) {
         logs.add(0, StrategyLogEntry(strategyId = rule.id, strategyName = rule.name, symbol = rule.symbol,
-            time = quote.updatedAt.toEpochMilli(), status = status, message = message, price = quote.price, orderId = orderId))
+            time = quote.updatedAt.toEpochMilli(), status = status, message = message, price = quote.price, orderId = orderId, executionId = executionId))
         logs = logs.take(500).toMutableList(); encode()
     }
     private fun offsetPrice(price: BigDecimal, offset: BigDecimal) = percent(price, offset)
@@ -292,6 +362,7 @@ class CryptoStrategyService : PersistentStateComponent<CryptoStrategyService.Sto
         stored.strategiesJson = gson.toJson(strategies); stored.runtimesJson = gson.toJson(runtimes); stored.logsJson = gson.toJson(logs)
         stored.draftsJson = gson.toJson(drafts); stored.historyJson = gson.toJson(history.mapValues { it.value.map(BigDecimal::toPlainString) })
         stored.quoteTimesJson = gson.toJson(quoteTimes)
+        stored.executionsJson = gson.toJson(executions)
     }
     private inline fun <reified T> decodeList(json: String): List<T> = runCatching {
         gson.fromJson<List<T>>(json, object : TypeToken<List<T>>() {}.type)
