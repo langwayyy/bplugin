@@ -28,6 +28,19 @@ data class TestnetOrder(
     val time: Long,
 )
 
+data class TestnetTrade(
+    val id: Long,
+    val orderId: Long,
+    val symbol: String,
+    val price: BigDecimal,
+    val quantity: BigDecimal,
+    val quoteQuantity: BigDecimal,
+    val commission: BigDecimal,
+    val commissionAsset: String,
+    val time: Long,
+    val buyer: Boolean,
+)
+
 data class TestnetSymbolRules(
     val minQuantity: BigDecimal,
     val maxQuantity: BigDecimal,
@@ -85,6 +98,14 @@ class BinanceTestnetClient {
 
     fun allOrders(symbol: String, apiKey: String, secret: String): List<TestnetOrder> = parseOrders(
         signed("GET", "/api/v3/allOrders", mapOf("symbol" to normalizeMarketSymbol(symbol), "limit" to "50"), apiKey, secret).asJsonArray)
+
+    fun trades(symbol: String, apiKey: String, secret: String): List<TestnetTrade> =
+        signed("GET", "/api/v3/myTrades", mapOf("symbol" to normalizeMarketSymbol(symbol), "limit" to "100"), apiKey, secret)
+            .asJsonArray.map { row -> row.asJsonObject.let {
+                TestnetTrade(it.get("id").asLong, it.get("orderId").asLong, it.get("symbol").asString,
+                    it.decimal("price"), it.decimal("qty"), it.decimal("quoteQty"), it.decimal("commission"),
+                    it.get("commissionAsset")?.asString.orEmpty(), it.get("time").asLong, it.get("isBuyer").asBoolean)
+            } }.sortedByDescending(TestnetTrade::time)
 
     fun placeOrder(symbol: String, side: PaperOrderSide, type: PaperOrderType, quantity: BigDecimal,
                    price: BigDecimal?, apiKey: String, secret: String): TestnetOrder {

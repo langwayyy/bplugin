@@ -70,6 +70,7 @@ class CryptoTestnetPanel(private val project: Project?, initialSymbol: String?, 
     private val service = CryptoTestnetTradingService.getInstance()
     private val market = CryptoMarketService.getInstance()
     private val assetSummary = JBLabel()
+    private val performanceSummary = JBLabel("近100笔成交估算：等待同步")
     private val updated = JBLabel()
     private val symbol = ComboBox<String>().apply { isEditable = true; preferredSize = JBUI.size(150, 28) }
     private val side = ComboBox(PaperOrderSide.entries.toTypedArray()).apply { selectedItem = initialSide }
@@ -85,6 +86,7 @@ class CryptoTestnetPanel(private val project: Project?, initialSymbol: String?, 
     private var balances = emptyList<TestnetBalance>()
     private var openOrders = emptyList<TestnetOrder>()
     private var history = emptyList<TestnetOrder>()
+    private var trades = emptyList<TestnetTrade>()
     private var fingerprint = ""
     private val balanceModel = object : AbstractTableModel() {
         override fun getRowCount() = balances.size
@@ -106,13 +108,28 @@ class CryptoTestnetPanel(private val project: Project?, initialSymbol: String?, 
         override fun getColumnName(column: Int) = arrayOf("时间", "交易对", "方向", "类型", "数量", "已成交", "成交均价", "状态")[column]
         override fun getValueAt(row: Int, column: Int): Any = orderCell(history[row], column)
     }
+    private val tradeModel = object : AbstractTableModel() {
+        override fun getRowCount() = trades.size
+        override fun getColumnCount() = 8
+        override fun getColumnName(column: Int) = arrayOf("时间", "方向", "数量", "成交价", "成交额", "手续费", "手续费资产", "订单 ID")[column]
+        override fun getValueAt(row: Int, column: Int): Any = trades[row].let { trade -> when (column) {
+            0 -> TIME.format(Instant.ofEpochMilli(trade.time)); 1 -> if (trade.buyer) "买入" else "卖出"
+            2 -> marketPrice(trade.quantity); 3 -> marketPrice(trade.price); 4 -> marketPrice(trade.quoteQuantity)
+            5 -> marketPrice(trade.commission); 6 -> trade.commissionAsset; else -> trade.orderId
+        } }
+    }
     private val orderTable = table(orderModel)
+    private val historyTable = table(historyModel)
     private val timer = Timer(1_000) { render() }
 
     init {
         border = JBUI.Borders.empty(4)
         add(JPanel(BorderLayout()).apply {
-            add(JPanel(FlowLayout(FlowLayout.LEFT, 16, 0)).apply { add(assetSummary); add(updated) }, BorderLayout.WEST)
+            add(JPanel().apply {
+                layout = BoxLayout(this, BoxLayout.Y_AXIS)
+                add(JPanel(FlowLayout(FlowLayout.LEFT, 16, 0)).apply { add(assetSummary); add(updated) })
+                add(JPanel(FlowLayout(FlowLayout.LEFT, 16, 0)).apply { add(performanceSummary) })
+            }, BorderLayout.WEST)
             add(JButton("同步账户").apply { addActionListener { service.refresh(selectedSymbol()); message.text = "正在同步测试网账户…" } }, BorderLayout.EAST)
         }, BorderLayout.NORTH)
         add(JPanel(BorderLayout(0, JBUI.scale(8))).apply {
@@ -136,7 +153,8 @@ class CryptoTestnetPanel(private val project: Project?, initialSymbol: String?, 
                     add(scroll(orderTable), BorderLayout.CENTER)
                     add(JPanel(FlowLayout(FlowLayout.RIGHT)).apply { add(cancelAll); add(cancel) }, BorderLayout.SOUTH)
                 })
-                addTab("订单记录", scroll(table(historyModel)))
+                addTab("订单记录", scroll(historyTable))
+                addTab("成交明细", scroll(table(tradeModel)))
             }, BorderLayout.CENTER)
             add(message, BorderLayout.SOUTH)
         }, BorderLayout.CENTER)
@@ -154,6 +172,8 @@ class CryptoTestnetPanel(private val project: Project?, initialSymbol: String?, 
         }
         quantity.document.addDocumentListener(documentListener)
         price.document.addDocumentListener(documentListener)
+        orderTable.addMouseListener(orderDetailsListener(orderTable) { openOrders })
+        historyTable.addMouseListener(orderDetailsListener(historyTable) { history })
         syncSymbols(initialSymbol)
         render()
     }
@@ -168,9 +188,14 @@ class CryptoTestnetPanel(private val project: Project?, initialSymbol: String?, 
         if (orderType == PaperOrderType.LIMIT && (limit == null || limit.signum() <= 0)) { message.text = "请输入有效限价"; return }
         val selected = selectedSymbol()
         val sideValue = side.selectedItem as PaperOrderSide
+        val notional = amount * (limit ?: market.quotes[selected]?.price ?: BigDecimal.ZERO)
+        val risk = CryptoSettings.getInstance().state
+        val warningAt = risk.testnetMaxOrderNotional.toBigDecimalOrNull()?.multiply(BigDecimal("0.8")) ?: BigDecimal.ZERO
+        val warning = if (warningAt.signum() > 0 && notional >= warningAt)
+            "\n⚠ 订单金额接近风控上限" else ""
         val detail = "$selected · ${sideValue.label} · ${orderType.label} · 数量 ${marketPrice(amount)}" +
             (limit?.let { " · 价格 ${marketPrice(it)}" } ?: "")
-        if (Messages.showYesNoDialog(project, "确认向 Binance Spot Testnet 提交：\n$detail", "确认测试网订单", null) != Messages.YES) return
+        if (Messages.showYesNoDialog(project, "确认向 Binance Spot Testnet 提交：\n$detail$warning", "确认测试网订单", null) != Messages.YES) return
         submit.isEnabled = false; message.text = "正在提交测试网订单…"
         service.place(selected, sideValue, orderType, amount, limit) { result ->
             submit.isEnabled = true
@@ -228,6 +253,27 @@ class CryptoTestnetPanel(private val project: Project?, initialSymbol: String?, 
         estimate.text = "预计金额：${if (amount != null && reference != null) marketPrice(amount * reference, 2) + " USDT" else "—"}" +
             " · 可用：${available?.let(::marketPrice) ?: "—"} $unit"
     }
+    private fun orderDetailsListener(table: JBTable, source: () -> List<TestnetOrder>) = object : java.awt.event.MouseAdapter() {
+        override fun mouseClicked(event: java.awt.event.MouseEvent) {
+            if (event.clickCount != 2) return
+            val row = table.selectedRow.takeIf { it >= 0 }?.let(table::convertRowIndexToModel) ?: return
+            source().getOrNull(row)?.let(::showOrderDetails)
+        }
+    }
+    private fun showOrderDetails(order: TestnetOrder) {
+        val detail = """
+            订单 ID：${order.id}
+            交易对：${order.symbol}
+            方向 / 类型：${order.side.label} / ${order.type.label}
+            状态：${statusLabel(order.status)}
+            委托数量：${marketPrice(order.quantity)}
+            已成交：${marketPrice(order.executedQuantity)}
+            委托价格：${order.price.takeIf { it.signum() > 0 }?.let(::marketPrice) ?: "市价"}
+            成交均价：${order.averagePrice?.let(::marketPrice) ?: "—"}
+            更新时间：${TIME.format(Instant.ofEpochMilli(order.time))}
+        """.trimIndent()
+        Messages.showInfoMessage(project, detail, "测试网订单详情")
+    }
     private fun render() {
         syncSymbols(null)
         updateEstimate()
@@ -238,9 +284,18 @@ class CryptoTestnetPanel(private val project: Project?, initialSymbol: String?, 
         balances = snapshot.balances.sortedWith(compareByDescending<TestnetBalance> { it.asset == "USDT" }.thenBy(TestnetBalance::asset))
         openOrders = snapshot.openOrders
         history = snapshot.history
-        balanceModel.fireTableDataChanged(); orderModel.fireTableDataChanged(); historyModel.fireTableDataChanged()
+        trades = snapshot.trades
+        balanceModel.fireTableDataChanged(); orderModel.fireTableDataChanged(); historyModel.fireTableDataChanged(); tradeModel.fireTableDataChanged()
         val usdt = balances.firstOrNull { it.asset == "USDT" }
-        assetSummary.text = "测试网 USDT：${marketPrice(usdt?.free ?: BigDecimal.ZERO, 2)} 可用 · ${marketPrice(usdt?.locked ?: BigDecimal.ZERO, 2)} 冻结"
+        val prices = market.quotes.mapValues { it.value.price }
+        val equity = testnetEquityUsdt(balances, prices)
+        assetSummary.text = "测试网权益：${marketPrice(equity, 2)} USDT · ${marketPrice(usdt?.free ?: BigDecimal.ZERO, 2)} 可用 · ${marketPrice(usdt?.locked ?: BigDecimal.ZERO, 2)} 冻结"
+        val selected = selectedSymbol()
+        val current = market.quotes[selected]?.price ?: trades.firstOrNull()?.price ?: BigDecimal.ZERO
+        val performance = analyzeTestnetTrades(selected, trades, current)
+        val feeText = performance.fees.entries.joinToString(" + ") { "${marketPrice(it.value)} ${it.key}" }.ifBlank { "0" }
+        performanceSummary.text = "近100笔成交估算：持仓 ${marketPrice(performance.position)} · 成本 ${marketPrice(performance.averageCost)} · " +
+            "已实现 ${signedPrice(performance.realizedPnl)} USDT · 未实现 ${signedPrice(performance.unrealizedPnl)} USDT · 手续费 $feeText"
         updated.text = snapshot.updatedAt?.let { "更新：${TIME.format(it)}" } ?: "尚未同步"
         updateEstimate()
         service.error?.let { message.text = "同步失败：$it" }
@@ -265,5 +320,6 @@ class CryptoTestnetPanel(private val project: Project?, initialSymbol: String?, 
         "NEW" -> "挂单中"; "PARTIALLY_FILLED" -> "部分成交"; "FILLED" -> "已成交"; "CANCELED" -> "已撤销"
         "REJECTED" -> "已拒绝"; "EXPIRED" -> "已过期"; else -> status
     }
+    private fun signedPrice(value: BigDecimal) = (if (value.signum() > 0) "+" else "") + marketPrice(value, 2)
     companion object { private val TIME = DateTimeFormatter.ofPattern("MM-dd HH:mm:ss").withZone(ZoneId.systemDefault()) }
 }

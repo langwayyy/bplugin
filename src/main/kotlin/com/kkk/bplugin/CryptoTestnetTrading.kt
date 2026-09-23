@@ -33,6 +33,7 @@ data class TestnetSnapshot(
     val balances: List<TestnetBalance> = emptyList(),
     val openOrders: List<TestnetOrder> = emptyList(),
     val history: List<TestnetOrder> = emptyList(),
+    val trades: List<TestnetTrade> = emptyList(),
     val updatedAt: Instant? = null,
 )
 
@@ -43,6 +44,15 @@ data class TestnetOrderDraft(
 ) {
     val notional: BigDecimal get() = quantity * referencePrice
 }
+
+data class TestnetExecutionEvent(
+    val orderId: Long,
+    val symbol: String,
+    val status: String,
+    val executedQuantity: BigDecimal,
+    val cumulativeQuoteQuantity: BigDecimal,
+    val time: Long,
+)
 
 object BinanceTestnetCredentials {
     private val attributes = CredentialAttributes("QuietCrypto.BinanceSpotTestnet.Secret")
@@ -63,8 +73,10 @@ class CryptoTestnetTradingService : Disposable {
     @Volatile var streamConnected = false; private set
     @Volatile var streamMessage: String? = null; private set
     @Volatile private var disposed = false
+    @Volatile private var lastOrderFingerprint = ""
+    @Volatile private var lastOrderAt = 0L
     private val stream = BinanceTestnetUserStream(
-        onEvent = { refresh(pendingSymbol) },
+        onEvent = { event -> if (event == null || !applyExecutionEvent(event)) refresh(pendingSymbol) },
         onState = { connected, message ->
             streamConnected = connected; streamMessage = message
             if (!connected) retryAt = System.currentTimeMillis() + 15_000
@@ -112,7 +124,8 @@ class CryptoTestnetTradingService : Disposable {
                 val balances = client.account(credentials.first, credentials.second)
                 val orders = client.openOrders(credentials.first, credentials.second)
                 val history = pendingSymbol?.let { client.allOrders(it, credentials.first, credentials.second) }.orEmpty()
-                TestnetSnapshot(balances, orders, history.filter { it.status !in setOf("NEW", "PARTIALLY_FILLED") }, Instant.now())
+                val trades = pendingSymbol?.let { client.trades(it, credentials.first, credentials.second) }.orEmpty()
+                TestnetSnapshot(balances, orders, history.filter { it.status !in setOf("NEW", "PARTIALLY_FILLED") }, trades, Instant.now())
             }
             result.onSuccess { snapshot = it; error = null; retryAt = 0; nextRefresh = System.currentTimeMillis() + 30_000 }
                 .onFailure { error = it.message ?: "测试网账户同步失败"; retryAt = System.currentTimeMillis() + 15_000 }
@@ -126,8 +139,19 @@ class CryptoTestnetTradingService : Disposable {
         if (!busy.compareAndSet(false, true)) return callback(Result.failure(IllegalStateException("测试网请求正在处理中")))
         ApplicationManager.getApplication().executeOnPooledThread {
             val result = runCatching {
-                val referencePrice = if (type == PaperOrderType.MARKET) client.tickerPrice(symbol) else price
+                val updated = snapshot.updatedAt ?: error("账户尚未完成同步")
+                if (updated.plusSeconds(60).isBefore(Instant.now())) error("账户数据已超过 60 秒，请先同步账户")
+                val currentPrice = client.tickerPrice(symbol)
+                val referencePrice = if (type == PaperOrderType.MARKET) currentPrice else price
                 client.rules(symbol, type).validate(quantity, referencePrice, type == PaperOrderType.LIMIT)?.let { error(it) }
+                val settings = CryptoSettings.getInstance().state
+                val policy = TestnetRiskPolicy(settings.testnetMaxOrderPercent,
+                    settings.testnetMaxOrderNotional.toBigDecimal(), settings.testnetMaxPriceDeviationPercent)
+                validateTestnetRisk(symbol, side, quantity, requireNotNull(referencePrice), currentPrice, snapshot.balances, policy)?.let { error(it) }
+                val fingerprint = "${normalizeMarketSymbol(symbol)}|$side|$type|${quantity.stripTrailingZeros()}|${price?.stripTrailingZeros()}"
+                val now = System.currentTimeMillis()
+                if (fingerprint == lastOrderFingerprint && now - lastOrderAt < 5_000) error("检测到重复订单，请稍后重试")
+                lastOrderFingerprint = fingerprint; lastOrderAt = now
                 client.placeOrder(symbol, side, type, quantity, price, credentials.first, credentials.second)
             }
             busy.set(false)
@@ -183,6 +207,20 @@ class CryptoTestnetTradingService : Disposable {
         }
     }
 
+    @Synchronized private fun applyExecutionEvent(event: TestnetExecutionEvent): Boolean {
+        val existing = (snapshot.openOrders + snapshot.history).firstOrNull { it.id == event.orderId } ?: return false
+        val average = event.cumulativeQuoteQuantity.takeIf { event.executedQuantity.signum() > 0 }
+            ?.divide(event.executedQuantity, 16, java.math.RoundingMode.HALF_UP)?.stripTrailingZeros()
+        val updated = existing.copy(status = event.status, executedQuantity = event.executedQuantity,
+            averagePrice = average ?: existing.averagePrice, time = event.time)
+        val active = event.status in setOf("NEW", "PARTIALLY_FILLED")
+        snapshot = snapshot.copy(
+            openOrders = (snapshot.openOrders.filterNot { it.id == event.orderId } + if (active) listOf(updated) else emptyList()).sortedByDescending(TestnetOrder::time),
+            history = (snapshot.history.filterNot { it.id == event.orderId } + if (active) emptyList() else listOf(updated)).sortedByDescending(TestnetOrder::time),
+        )
+        return true
+    }
+
     private fun credentials(): Pair<String, String>? {
         val key = CryptoSettings.getInstance().state.testnetApiKey.trim()
         val secret = BinanceTestnetCredentials.secret()
@@ -203,7 +241,7 @@ class CryptoTestnetTradingService : Disposable {
 
 /** Signed Spot Testnet user-data subscription. Events are followed by a REST state reconciliation. */
 internal class BinanceTestnetUserStream(
-    private val onEvent: () -> Unit,
+    private val onEvent: (TestnetExecutionEvent?) -> Unit,
     private val onState: (Boolean, String?) -> Unit,
 ) : AutoCloseable {
     private val http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).apply {
@@ -266,7 +304,16 @@ internal class BinanceTestnetUserStream(
                         onState(status == 200, if (status == 200) null else root.getAsJsonObject("error")?.get("msg")?.asString)
                         if (status != 200) { socket = null; webSocket.abort() }
                     }
-                    else if (root?.has("event") == true || root?.has("subscriptionId") == true) { onState(true, null); onEvent() }
+                    else if (root?.has("event") == true || root?.has("subscriptionId") == true) {
+                        onState(true, null)
+                        val event = root.getAsJsonObject("event")?.takeIf { it.get("e")?.asString == "executionReport" }?.let {
+                            TestnetExecutionEvent(it.get("i").asLong, it.get("s").asString, it.get("X").asString,
+                                it.get("z")?.asString?.toBigDecimalOrNull() ?: BigDecimal.ZERO,
+                                it.get("Z")?.asString?.toBigDecimalOrNull() ?: BigDecimal.ZERO,
+                                it.get("E")?.asLong ?: System.currentTimeMillis())
+                        }
+                        onEvent(event)
+                    }
                 }
             }
             webSocket.request(1); return null
