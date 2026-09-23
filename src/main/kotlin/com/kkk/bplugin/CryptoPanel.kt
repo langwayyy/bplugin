@@ -115,6 +115,7 @@ class CryptoPanel(private val project: Project?) : JPanel(BorderLayout(0, JBUI.s
             add(JPanel(FlowLayout(FlowLayout.LEFT)).apply {
                 add(search); add(quote); add(matches); add(add); add(JBLabel("分组")); add(groupFilter)
                 add(JButton("交易账户").apply { addActionListener { CryptoPaperPopup.show(project) } })
+                add(JButton("策略中心").apply { addActionListener { CryptoStrategyPopup.show(project) } })
                 add(JButton("刷新").apply { addActionListener { service.refresh() } })
                 add(JButton("设置").apply { addActionListener { ShowSettingsUtil.getInstance().showSettingsDialog(project, CryptoConfigurable::class.java) } })
             }, BorderLayout.NORTH)

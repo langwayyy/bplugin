@@ -240,6 +240,19 @@ class CryptoChartCanvas(private val watermark: Boolean = false) : JComponent() {
             drawAverage(5, JBColor(0xD08A22, 0xF2B84B))
             drawAverage(10, JBColor(0x5479B8, 0x83A9E8))
             drawAverage(20, JBColor(0x8B5FA8, 0xBE8CDB))
+            if (!watermark) {
+                val markers = CryptoStrategyService.getInstance().logs()
+                    .filter { it.symbol == s.selected && it.status in setOf("已触发", "已执行", "待确认") && it.time in bars.first().timestamp..bars.last().timestamp }
+                    .distinctBy { "${it.strategyId}:${it.time}" }.take(30)
+                markers.forEach { event ->
+                    val index = bars.indices.minByOrNull { kotlin.math.abs(bars[it].timestamp - event.time) } ?: return@forEach
+                    val x = 12 + ((index + 0.5) * stride).toInt()
+                    val markerY = (y(bars[index].high) - 9).coerceAtLeast(top + 2)
+                    g.color = if (event.status == "待确认") JBColor(0xD08A22, 0xF2B84B) else JBColor(0x7A4FA3, 0xC18AE5)
+                    g.fillPolygon(intArrayOf(x, x - 5, x + 5), intArrayOf(markerY + 7, markerY, markerY), 3)
+                    g.drawString("策", x + 7, markerY + 7)
+                }
+            }
             if (!watermark && s.tradingMode == TradingAccountMode.TESTNET.name) {
                 val orders = CryptoTestnetTradingService.getInstance().snapshot.openOrders.filter { it.symbol == s.selected }
                 val lines = orders.flatMap { order -> buildList {

@@ -61,6 +61,7 @@ data class TestnetExecutionEvent(
     val cumulativeQuoteQuantity: BigDecimal,
     val time: Long,
 )
+data class TestnetOcoDraft(val quantity: BigDecimal, val targetPrice: BigDecimal, val stopPrice: BigDecimal, val stopLimitPrice: BigDecimal)
 data class TestnetOrderListEvent(val orderListId: Long, val status: String, val time: Long)
 
 object BinanceTestnetCredentials {
@@ -259,6 +260,25 @@ class CryptoTestnetTradingService : Disposable {
                 val normalizedQuantity = rules.normalizeQuantity(rawQuantity)
                 rules.validate(normalizedQuantity, reference, type == PaperOrderType.LIMIT)?.let { error(it) }
                 TestnetOrderDraft(normalizedQuantity, if (type == PaperOrderType.LIMIT) reference else null, reference)
+            }
+            busy.set(false)
+            ApplicationManager.getApplication().invokeLater { callback(result) }
+        }
+    }
+
+    fun prepareOco(symbol: String, quantity: BigDecimal, targetPrice: BigDecimal, stopPrice: BigDecimal,
+                   stopLimitPrice: BigDecimal, callback: (Result<TestnetOcoDraft>) -> Unit) {
+        if (!busy.compareAndSet(false, true)) return callback(Result.failure(IllegalStateException("测试网请求正在处理中")))
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val result = runCatching {
+                val normalized = normalizeMarketSymbol(symbol)
+                val rules = client.rules(normalized, PaperOrderType.LIMIT)
+                val draft = TestnetOcoDraft(rules.normalizeQuantity(quantity), rules.normalizePrice(targetPrice),
+                    rules.normalizePrice(stopPrice), rules.normalizePrice(stopLimitPrice))
+                listOf(draft.targetPrice, draft.stopPrice, draft.stopLimitPrice).forEach { value ->
+                    rules.validate(draft.quantity, value)?.let { error(it) }
+                }
+                draft
             }
             busy.set(false)
             ApplicationManager.getApplication().invokeLater { callback(result) }
