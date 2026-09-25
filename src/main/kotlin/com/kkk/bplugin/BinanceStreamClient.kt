@@ -20,7 +20,7 @@ data class StreamCandle(val symbol: String, val period: KlinePeriod, val bar: Kl
 
 internal data class StreamSpec(val tickerSymbols: List<String>, val chartSymbol: String, val period: KlinePeriod) {
     fun streams(): List<String> = tickerSymbols.distinct().sorted().map { "${it.lowercase(Locale.ROOT)}@ticker" } +
-        "${chartSymbol.lowercase(Locale.ROOT)}@kline_${period.binanceInterval()}"
+        (tickerSymbols + chartSymbol).distinct().sorted().map { "${it.lowercase(Locale.ROOT)}@kline_${period.binanceInterval()}" }
 }
 
 internal fun KlinePeriod.binanceInterval() = when (this) {

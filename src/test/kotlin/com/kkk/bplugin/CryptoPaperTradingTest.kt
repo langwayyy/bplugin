@@ -88,4 +88,16 @@ class CryptoPaperTradingTest : TestCase() {
         assertEquals(2, book.account.orders.count { it.ocoGroupId == order.ocoGroupId && it.status == PaperOrderStatus.CANCELLED })
         assertEquals(0, BigDecimal.ONE.compareTo(book.availableQuantity("BTCUSDT")))
     }
+
+    fun testBarFillPolicyMatchesBacktestAmbiguityRule() {
+        fun result(policy: IntrabarFillPolicy): BigDecimal {
+            val book = PaperTradingBook(PaperAccount(), feeBps = 0, slippageBps = 0)
+            book.place("BTCUSDT", PaperOrderSide.BUY, PaperOrderType.MARKET, BigDecimal.ONE, null, BigDecimal("100"))
+            book.placeOco("BTCUSDT", PaperOrderSide.SELL, BigDecimal.ONE, BigDecimal("110"), BigDecimal("90"), BigDecimal("90"), BigDecimal("100"))
+            book.onBar("BTCUSDT", KlineBar(1, 100.0, 115.0, 85.0, 105.0, 10.0), policy)
+            return book.account.realizedPnl
+        }
+        assertTrue(result(IntrabarFillPolicy.OPTIMISTIC) > result(IntrabarFillPolicy.CONSERVATIVE))
+        assertEquals(result(IntrabarFillPolicy.CONSERVATIVE), result(IntrabarFillPolicy.PRICE_PATH))
+    }
 }

@@ -7,6 +7,7 @@
     <extensions defaultExtensionNs="com.intellij">
         <statusBarWidgetFactory id="com.kkk.bplugin.ticker" implementation="com.kkk.bplugin.CryptoWidgetFactory"/>
         <applicationConfigurable id="com.kkk.bplugin.settings" parentId="tools" displayName="Quiet Crypto" instance="com.kkk.bplugin.CryptoConfigurable"/>
+        <notificationGroup id="Quiet Crypto" displayType="BALLOON" isLogByDefault="true"/>
     </extensions>
     <applicationListeners>
         <listener class="com.kkk.bplugin.CryptoEditorListener" topic="com.intellij.openapi.editor.event.EditorFactoryListener"/>

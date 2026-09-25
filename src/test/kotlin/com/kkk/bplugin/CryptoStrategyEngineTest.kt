@@ -5,10 +5,11 @@ import org.junit.Assert.*
 import org.junit.Test
 import java.math.BigDecimal
 import java.time.Instant
-import java.time.LocalDate
+import java.time.ZoneId
 
 class CryptoStrategyEngineTest {
     private val start = Instant.parse("2026-09-23T00:00:00Z")
+    private val startDate = start.atZone(ZoneId.systemDefault()).toLocalDate().toString()
     private fun quote(price: String, change: String = "0", turnover: String = "1000", at: Instant = start) =
         CryptoQuote("BTCUSDT", BigDecimal(price), BigDecimal(change), BigDecimal(price), BigDecimal(price), BigDecimal(turnover), at)
     private fun rule(condition: StrategyCondition = StrategyCondition.PRICE_ABOVE, threshold: String = "100") =
@@ -28,14 +29,14 @@ class CryptoStrategyEngineTest {
     @Test fun `cooldown blocks a fresh crossing and records reason`() {
         val item = rule()
         val runtime = StrategyRuntime(previousMetric = "99", lastTriggeredAt = start.toEpochMilli(),
-            executionDate = LocalDate.now().toString(), executionsToday = 1)
+            executionDate = startDate, executionsToday = 1)
         val result = StrategyEvaluator.evaluate(item, quote("101", at = start.plusSeconds(60)), emptyList(), runtime, false, 1, 20, start.plusSeconds(60))
         assertTrue(result.crossed); assertFalse(result.ready); assertEquals("策略冷却中", result.reason)
     }
 
     @Test fun `daily and global controls block execution`() {
         val item = rule().copy(maxExecutionsPerDay = 1)
-        val runtime = StrategyRuntime(previousMetric = "99", executionDate = LocalDate.now().toString(), executionsToday = 1)
+        val runtime = StrategyRuntime(previousMetric = "99", executionDate = startDate, executionsToday = 1)
         assertEquals("已达到单策略每日执行上限", StrategyEvaluator.evaluate(item, quote("101"), emptyList(), runtime, false, 1, 20, start).reason)
         assertEquals("策略中心已暂停", StrategyEvaluator.evaluate(item, quote("101"), emptyList(), runtime.copy(executionsToday = 0), true, 0, 20, start).reason)
         assertEquals("已达到全局每日执行上限", StrategyEvaluator.evaluate(item, quote("101"), emptyList(), runtime.copy(executionsToday = 0), false, 20, 20, start).reason)

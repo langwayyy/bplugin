@@ -29,4 +29,23 @@ class StrategyBacktestTest {
         val charged = StrategyBacktester.run(rule, bars(), BacktestConfig(feeBps = 10, slippageBps = 2))
         assertTrue(charged.finalEquity < free.finalEquity)
     }
+
+    @Test fun `intrabar policy resolves simultaneous target and stop deterministically`() {
+        val volatile = bars().dropLast(1) + KlineBar(21 * 60_000L, 101.0, 110.0, 90.0, 105.0, 150.0)
+        val conservative = StrategyBacktester.run(rule, volatile, BacktestConfig(feeBps = 0, slippageBps = 0,
+            fillPolicy = IntrabarFillPolicy.CONSERVATIVE))
+        val optimistic = StrategyBacktester.run(rule, volatile, BacktestConfig(feeBps = 0, slippageBps = 0,
+            fillPolicy = IntrabarFillPolicy.OPTIMISTIC))
+        assertEquals("OCO 止损", conservative.trades.last().reason)
+        assertEquals("OCO 止盈", optimistic.trades.last().reason)
+        assertTrue(optimistic.finalEquity > conservative.finalEquity)
+        assertEquals(21 * 60_000L, conservative.trades.first().time)
+    }
+
+    @Test fun `reports export without credentials`() {
+        val report = StrategyBacktester.run(rule, bars(), BacktestConfig(feeBps = 0, slippageBps = 0))
+        val csv = BacktestReportExporter.csv(report); val html = BacktestReportExporter.html(report)
+        assertTrue(csv.startsWith("time,side")); assertTrue(html.contains("资金曲线")); assertTrue(html.contains("不含 API Key"))
+        assertFalse(html.contains("Secret Key"))
+    }
 }

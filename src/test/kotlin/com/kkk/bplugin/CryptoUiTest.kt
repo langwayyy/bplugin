@@ -13,6 +13,22 @@ import javax.swing.JComponent
 
 /** Exercises real IntelliJ services and Swing construction without network requests. */
 class CryptoUiTest : BasePlatformTestCase() {
+    fun testCloseConfirmedStrategyIgnoresTickerUntilClosedCandle() {
+        val service = CryptoStrategyService.getInstance(); val before = service.state.copy()
+        try {
+            val rule = CryptoStrategyRule(name = "close-only", symbol = "BTCUSDT", condition = StrategyCondition.PRICE_ABOVE,
+                threshold = BigDecimal("100"), action = StrategyAction.TESTNET_DRAFT, budgetUsdt = BigDecimal.ONE, triggerMode = StrategyTriggerMode.CLOSE)
+            service.loadState(CryptoStrategyService.StoredState(strategiesJson = com.google.gson.Gson().toJson(listOf(rule))))
+            service.setPortfolioRisk(PortfolioRiskConfig(100, 100, 100, 100, 100))
+            val now = System.currentTimeMillis()
+            service.onQuote(CryptoQuote("BTCUSDT", BigDecimal("99"), BigDecimal.ZERO, BigDecimal("99"), BigDecimal("99"), BigDecimal.ONE, Instant.ofEpochMilli(now - 2_000)))
+            service.onQuote(CryptoQuote("BTCUSDT", BigDecimal("101"), BigDecimal.ZERO, BigDecimal("101"), BigDecimal("101"), BigDecimal.ONE, Instant.ofEpochMilli(now - 1_000)))
+            assertTrue(service.drafts().isEmpty())
+            service.onClosedCandle("BTCUSDT", KlineBar(now - 3_600_000, 99.0, 99.0, 99.0, 99.0, 1.0))
+            service.onClosedCandle("BTCUSDT", KlineBar(now, 101.0, 101.0, 101.0, 101.0, 1.0))
+            assertEquals(1, service.drafts().size)
+        } finally { service.loadState(before) }
+    }
     fun testStrategyExportRoundTripExcludesCredentialsAndRuntime() {
         val service = CryptoStrategyService.getInstance()
         val before = service.state.copy()

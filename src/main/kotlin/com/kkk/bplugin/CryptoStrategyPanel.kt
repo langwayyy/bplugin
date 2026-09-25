@@ -44,6 +44,9 @@ class CryptoStrategyPanel(private val project: Project?) : JPanel(BorderLayout(0
     private var logs = emptyList<StrategyLogEntry>()
     private var drafts = emptyList<StrategyOrderDraft>()
     private var executions = emptyList<StrategyExecution>()
+    private val logStatus = ComboBox(arrayOf("全部状态", "已触发", "已执行", "待确认", "风控阻止", "失败", "跳过"))
+    private val logRange = ComboBox(arrayOf("全部日期", "今天", "最近7天"))
+    private val logSearch = JBTextField().apply { columns = 14; emptyText.text = "策略或交易对" }
     private var fingerprint = ""
     private val ruleModel = object : AbstractTableModel() {
         override fun getRowCount() = rules.size
@@ -101,6 +104,7 @@ class CryptoStrategyPanel(private val project: Project?) : JPanel(BorderLayout(0
     private val executionTable = table(executionModel)
     private val timer = Timer(1_000) { render() }
     private val backtest = StrategyBacktestPanel(project)
+    private val diagnostics = JTextArea().apply { isEditable = false; lineWrap = false; font = UIManager.getFont("TextArea.font") }
 
     init {
         border = JBUI.Borders.empty(12); preferredSize = JBUI.size(1120, 650)
@@ -114,7 +118,9 @@ class CryptoStrategyPanel(private val project: Project?) : JPanel(BorderLayout(0
                 add(JPanel(FlowLayout(FlowLayout.LEFT)).apply {
                     add(JButton("历史回放").apply { addActionListener { replaySelected() } }); add(JButton("完整回测").apply { addActionListener { selectedRule()?.let { backtest.run(it) } ?: showHint("请先选择策略") } })
                     add(JButton("参数对比").apply { addActionListener { selectedRule()?.let { backtest.compare(it) } ?: showHint("请先选择策略") } })
+                    add(JButton("样本外验证").apply { addActionListener { selectedRule()?.let { backtest.walkForward(it) } ?: showHint("请先选择策略") } })
                     add(JButton("风控上限").apply { addActionListener { editLimits() } }); add(JButton("导入").apply { addActionListener { importRules() } }); add(JButton("导出").apply { addActionListener { exportRules() } })
+                    add(JButton("组合风控").apply { addActionListener { editPortfolioRisk() } })
                 })
             }, BorderLayout.CENTER)
             add(hint, BorderLayout.SOUTH)
@@ -122,6 +128,7 @@ class CryptoStrategyPanel(private val project: Project?) : JPanel(BorderLayout(0
         add(JTabbedPane().apply {
             addTab("策略", JBScrollPane(ruleTable))
             addTab("运行日志", JPanel(BorderLayout()).apply {
+                add(JPanel(FlowLayout(FlowLayout.LEFT)).apply { add(logStatus); add(logRange); add(logSearch); add(JButton("筛选").apply { addActionListener { render(true) } }) }, BorderLayout.NORTH)
                 add(JBScrollPane(logTable), BorderLayout.CENTER)
                 add(JPanel(FlowLayout(FlowLayout.RIGHT)).apply { add(JButton("清空日志").apply { addActionListener { service.clearLogs(); render(true) } }) }, BorderLayout.SOUTH)
             })
@@ -134,6 +141,13 @@ class CryptoStrategyPanel(private val project: Project?) : JPanel(BorderLayout(0
             })
             addTab("执行状态", JBScrollPane(executionTable))
             addTab("回测报告", backtest)
+            addTab("运行诊断", JPanel(BorderLayout()).apply {
+                add(JBScrollPane(diagnostics), BorderLayout.CENTER)
+                add(JPanel(FlowLayout(FlowLayout.RIGHT)).apply {
+                    add(JButton("刷新诊断").apply { addActionListener { diagnostics.text = service.diagnostics() } })
+                    add(JButton("复制脱敏诊断").apply { addActionListener { Toolkit.getDefaultToolkit().systemClipboard.setContents(StringSelection(service.diagnostics()), null); hint.text = "脱敏诊断已复制" } })
+                }, BorderLayout.SOUTH)
+            })
         }, BorderLayout.CENTER)
         render(true)
     }
@@ -173,6 +187,19 @@ class CryptoStrategyPanel(private val project: Project?) : JPanel(BorderLayout(0
         val open = Messages.showInputDialog(project, "策略允许的最大未完成订单数（1-100）", "策略风控", null, current.second.toString(), null)?.toIntOrNull() ?: return
         service.setLimits(daily, open); render(true)
     }
+    private fun editPortfolioRisk() {
+        val current = service.portfolioRisk()
+        fun ask(label: String, value: Int) = Messages.showInputDialog(project, label, "组合风控", null, value.toString(), null)?.toIntOrNull()
+        val total = ask("组合最大总敞口 %（1-100）", current.maxTotalExposurePercent) ?: return
+        val symbol = ask("单币种最大敞口 %（1-100）", current.maxSymbolExposurePercent) ?: return
+        val daily = ask("每日最大亏损 %（1-100）", current.dailyLossLimitPercent) ?: return
+        val drawdown = ask("组合最大回撤 %（1-100）", current.maxDrawdownPercent) ?: return
+        val losses = ask("连续亏损暂停次数（1-100）", current.maxConsecutiveLosses) ?: return
+        service.setPortfolioRisk(PortfolioRiskConfig(total, symbol, daily, drawdown, losses))
+        if (service.portfolioRuntime().pausedReason.isNotBlank() && Messages.showYesNoDialog(project,
+                "当前组合风控已暂停：${service.portfolioRuntime().pausedReason}。是否同时手动恢复？", "组合风控", null) == Messages.YES) service.resumePortfolioRisk()
+        render(true)
+    }
     private fun confirmDraft() {
         val item = selectedDraft() ?: return showHint("请先选择草稿")
         if (Messages.showYesNoDialog(project, "将按当前测试网账户和风控规则提交 ${item.rule.symbol} ${item.rule.orderTemplate.label} 订单。",
@@ -192,14 +219,21 @@ class CryptoStrategyPanel(private val project: Project?) : JPanel(BorderLayout(0
     }
     private fun render(force: Boolean = false) {
         service.reconcileTestnetExecutions()
-        val nextRules = service.strategies(); val nextLogs = service.logs(); val nextDrafts = service.drafts(); val nextExecutions = service.executions()
-        val next = "$nextRules|${nextLogs.take(30)}|$nextDrafts|${nextExecutions.take(30)}|${service.isPaused()}|${service.isTestnetAutoEnabled()}|${service.limits()}"
+        val nextRules = service.strategies(); val allLogs = service.logs(); val nextDrafts = service.drafts(); val nextExecutions = service.executions()
+        val statusFilter = logStatus.selectedItem?.toString().orEmpty(); val rangeFilter = logRange.selectedItem?.toString().orEmpty(); val query = logSearch.text.trim()
+        val cutoff = when (rangeFilter) { "今天" -> java.time.LocalDate.now().atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+            "最近7天" -> System.currentTimeMillis() - 7 * 86_400_000L; else -> Long.MIN_VALUE }
+        val nextLogs = allLogs.filter { (statusFilter == "全部状态" || it.status == statusFilter) && it.time >= cutoff &&
+            (query.isBlank() || it.strategyName.contains(query, true) || it.symbol.contains(query, true)) }
+        val next = "$nextRules|${allLogs.take(30)}|$statusFilter|$rangeFilter|$query|$nextDrafts|${nextExecutions.take(30)}|${service.isPaused()}|${service.isTestnetAutoEnabled()}|${service.limits()}"
         if (!force && next == fingerprint) return
         fingerprint = next; rules = nextRules; logs = nextLogs; drafts = nextDrafts; executions = nextExecutions
         ruleModel.fireTableDataChanged(); logModel.fireTableDataChanged(); draftModel.fireTableDataChanged(); executionModel.fireTableDataChanged()
         val limits = service.limits()
-        status.text = "${if (service.isPaused()) "已暂停" else "运行中"} · 自动测试网 ${if (service.isTestnetAutoEnabled()) "已开启" else "已关闭"} · 每日 ${limits.first} 次 · 未完成订单 ${limits.second} 个"
+        val riskPause = service.portfolioRuntime().pausedReason
+        status.text = "${if (service.isPaused()) "已暂停" else if (riskPause.isNotBlank()) "风控暂停：$riskPause" else "运行中"} · 自动测试网 ${if (service.isTestnetAutoEnabled()) "已开启" else "已关闭"} · 每日 ${limits.first} 次 · 未完成订单 ${limits.second} 个"
         status.foreground = if (service.isPaused()) JBColor(0xB05A00, 0xE6A04A) else JBColor(0x2A7D4F, 0x63C68B)
+        diagnostics.text = service.diagnostics()
     }
     private fun showHint(value: String) { hint.text = value }
     private fun table(model: AbstractTableModel) = JBTable(model).apply { rowHeight = JBUI.scale(28); setShowGrid(false); autoCreateRowSorter = true; setSelectionMode(ListSelectionModel.SINGLE_SELECTION) }
@@ -224,10 +258,11 @@ private class StrategyDialog(project: Project?, source: CryptoStrategyRule?) : D
     private val stop = JBTextField(source?.stopPercent?.toPlainString() ?: "2")
     private val cooldown = JBTextField((source?.cooldownMinutes ?: 30).toString())
     private val daily = JBTextField((source?.maxExecutionsPerDay ?: 3).toString())
+    private val triggerMode = ComboBox(StrategyTriggerMode.entries.toTypedArray()).apply { selectedItem = source?.triggerMode ?: StrategyTriggerMode.INTRABAR }
     init { title = if (source == null) "新建策略" else "编辑策略"; init() }
     override fun createCenterPanel(): JComponent = FormBuilder.createFormBuilder()
         .addLabeledComponent("名称", name).addLabeledComponent("交易对", symbol)
-        .addLabeledComponent("条件", condition).addLabeledComponent("阈值", threshold)
+        .addLabeledComponent("条件", condition).addLabeledComponent("触发时机", triggerMode).addLabeledComponent("阈值", threshold)
         .addLabeledComponent("短 / 长均线", JPanel(FlowLayout(FlowLayout.LEFT, 4, 0)).apply { add(fast); add(JLabel("/")); add(slow) })
         .addLabeledComponent("动作", action).addLabeledComponent("方向", side).addLabeledComponent("订单模板", template)
         .addLabeledComponent("单次预算 USDT", budget).addLabeledComponent("限价偏移 %", limitOffset)
@@ -251,5 +286,6 @@ private class StrategyDialog(project: Project?, source: CryptoStrategyRule?) : D
         action = action.selectedItem as StrategyAction, side = side.selectedItem as PaperOrderSide,
         orderTemplate = template.selectedItem as StrategyOrderTemplate, budgetUsdt = budget.text.toBigDecimal(),
         limitOffsetPercent = limitOffset.text.toBigDecimal(), targetPercent = target.text.toBigDecimal(), stopPercent = stop.text.toBigDecimal(),
-        cooldownMinutes = cooldown.text.toInt(), maxExecutionsPerDay = daily.text.toInt(), enabled = existing?.enabled ?: true)
+        cooldownMinutes = cooldown.text.toInt(), maxExecutionsPerDay = daily.text.toInt(), enabled = existing?.enabled ?: true,
+        triggerMode = triggerMode.selectedItem as StrategyTriggerMode)
 }

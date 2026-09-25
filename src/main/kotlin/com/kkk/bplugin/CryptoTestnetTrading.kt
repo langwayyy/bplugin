@@ -103,6 +103,8 @@ class CryptoTestnetTradingService : Disposable {
     }, 2, 5, TimeUnit.SECONDS)
 
     fun hasCredentials() = CryptoSettings.getInstance().state.testnetApiKey.isNotBlank() && BinanceTestnetCredentials.secret().isNotBlank()
+    fun trackedSymbols(): List<String> = snapshot.balances.filter { it.asset != "USDT" && it.total.signum() > 0 }
+        .map { "${it.asset}USDT" }.filter(::isCryptoSymbol).distinct()
 
     fun credentialsChanged() {
         stream.disconnect()

@@ -35,8 +35,8 @@ data class PaperOrder(
     val filledAt: Long? = null,
     val fillPrice: BigDecimal? = null,
     val fee: BigDecimal = ZERO,
-    val ocoGroupId: String = "",
-    val ocoRole: String = "",
+    val ocoGroupId: String? = null,
+    val ocoRole: String? = null,
     val triggerPrice: BigDecimal? = null,
 )
 
@@ -119,7 +119,7 @@ internal class PaperTradingBook(
             "STOP" -> if (order.side == PaperOrderSide.BUY) price >= order.triggerPrice!! else price <= order.triggerPrice!!
             else -> if (order.side == PaperOrderSide.BUY) price <= order.limitPrice!! else price >= order.limitPrice!!
         }}.sortedWith(compareByDescending<PaperOrder> { it.ocoRole == "STOP" }.thenBy(PaperOrder::createdAt))
-            .distinctBy { it.ocoGroupId.ifBlank { it.id } }.map(PaperOrder::id)
+            .distinctBy { it.ocoGroupId?.takeIf(String::isNotBlank) ?: it.id }.map(PaperOrder::id)
         ids.forEach { id ->
             val order = account.orders.first { it.id == id }
             val slipped = slipped(price, order.side)
@@ -129,16 +129,42 @@ internal class PaperTradingBook(
         return ids.isNotEmpty()
     }
 
+    fun onBar(symbol: String, bar: KlineBar, policy: IntrabarFillPolicy = IntrabarFillPolicy.CONSERVATIVE): Boolean {
+        val low = BigDecimal.valueOf(bar.low); val high = BigDecimal.valueOf(bar.high)
+        val open = account.orders.filter { it.status == PaperOrderStatus.OPEN && it.symbol == symbol }
+        val selected = mutableListOf<PaperOrder>()
+        open.filter { it.ocoGroupId.isNullOrBlank() && it.type == PaperOrderType.LIMIT }.filterTo(selected) {
+            if (it.side == PaperOrderSide.BUY) low <= it.limitPrice!! else high >= it.limitPrice!!
+        }
+        open.filter { !it.ocoGroupId.isNullOrBlank() }.groupBy { it.ocoGroupId.orEmpty() }.values.forEach { group ->
+            val target = group.firstOrNull { it.ocoRole == "TARGET" }; val stop = group.firstOrNull { it.ocoRole == "STOP" }
+            if (target == null || stop == null) return@forEach
+            val hitTarget = if (target.side == PaperOrderSide.SELL) high >= target.limitPrice!! else low <= target.limitPrice!!
+            val hitStop = if (stop.side == PaperOrderSide.SELL) low <= stop.triggerPrice!! else high >= stop.triggerPrice!!
+            if (hitTarget || hitStop) {
+                val stopFirst = when { !hitStop -> false; !hitTarget -> true
+                    policy == IntrabarFillPolicy.CONSERVATIVE -> true
+                    policy == IntrabarFillPolicy.OPTIMISTIC -> false
+                    else -> bar.close >= bar.open }
+                selected += if (stopFirst) stop else target
+            }
+        }
+        selected.sortedBy(PaperOrder::createdAt).forEach { order ->
+            if (account.orders.any { it.id == order.id && it.status == PaperOrderStatus.OPEN }) fill(order.id, order.limitPrice!!)
+        }
+        return selected.isNotEmpty()
+    }
+
     fun cancel(id: String): Boolean {
         val target = account.orders.firstOrNull { it.id == id && it.status == PaperOrderStatus.OPEN } ?: return false
-        account = account.copy(orders = account.orders.map { if (it.id == target.id || target.ocoGroupId.isNotBlank() && it.ocoGroupId == target.ocoGroupId && it.status == PaperOrderStatus.OPEN) it.copy(status = PaperOrderStatus.CANCELLED) else it })
+        account = account.copy(orders = account.orders.map { if (it.id == target.id || !target.ocoGroupId.isNullOrBlank() && it.ocoGroupId == target.ocoGroupId && it.status == PaperOrderStatus.OPEN) it.copy(status = PaperOrderStatus.CANCELLED) else it })
         return true
     }
 
     fun availableCash(): BigDecimal {
         val open = account.orders.filter { it.status == PaperOrderStatus.OPEN && it.side == PaperOrderSide.BUY }
-        val regular = open.filter { it.ocoGroupId.isBlank() }.sumOf { feeAdjusted(it.quantity * it.limitPrice!!, true) }
-        val grouped = open.filter { it.ocoGroupId.isNotBlank() }.groupBy(PaperOrder::ocoGroupId).values
+        val regular = open.filter { it.ocoGroupId.isNullOrBlank() }.sumOf { feeAdjusted(it.quantity * it.limitPrice!!, true) }
+        val grouped = open.filter { !it.ocoGroupId.isNullOrBlank() }.groupBy { it.ocoGroupId.orEmpty() }.values
             .sumOf { group -> group.maxOf { feeAdjusted(it.quantity * it.limitPrice!!, true) } }
         return account.cash.subtract(regular + grouped).max(ZERO)
     }
@@ -146,8 +172,8 @@ internal class PaperTradingBook(
     fun availableQuantity(symbol: String): BigDecimal {
         val held = account.positions.firstOrNull { it.symbol == symbol }?.quantity ?: ZERO
         val open = account.orders.filter { it.status == PaperOrderStatus.OPEN && it.side == PaperOrderSide.SELL && it.symbol == symbol }
-        val reserved = open.filter { it.ocoGroupId.isBlank() }.sumOf(PaperOrder::quantity) +
-            open.filter { it.ocoGroupId.isNotBlank() }.groupBy(PaperOrder::ocoGroupId).values.sumOf { it.maxOf(PaperOrder::quantity) }
+        val reserved = open.filter { it.ocoGroupId.isNullOrBlank() }.sumOf(PaperOrder::quantity) +
+            open.filter { !it.ocoGroupId.isNullOrBlank() }.groupBy { it.ocoGroupId.orEmpty() }.values.sumOf { it.maxOf(PaperOrder::quantity) }
         return held.subtract(reserved).max(ZERO)
     }
 
@@ -192,7 +218,7 @@ internal class PaperTradingBook(
         account = account.copy(cash = cash.max(ZERO).stripTrailingZeros(), realizedPnl = realized.stripTrailingZeros(),
             positions = positions.sortedBy(PaperPosition::symbol), orders = account.orders.map {
                 when { it.id == id -> filled
-                    order.ocoGroupId.isNotBlank() && it.ocoGroupId == order.ocoGroupId && it.status == PaperOrderStatus.OPEN -> it.copy(status = PaperOrderStatus.CANCELLED)
+                    !order.ocoGroupId.isNullOrBlank() && it.ocoGroupId == order.ocoGroupId && it.status == PaperOrderStatus.OPEN -> it.copy(status = PaperOrderStatus.CANCELLED)
                     else -> it }
             })
     }
@@ -248,7 +274,20 @@ class CryptoPaperTradingService : PersistentStateComponent<CryptoPaperTradingSer
         return book.placeOco(normalized, side, quantity, targetPrice, stopPrice, stopLimitPrice, marketPrice).also { if (it.accepted) save() }
     }
     @Synchronized fun cancel(id: String): Boolean = book.cancel(id).also { if (it) save() }
-    @Synchronized fun onQuote(quote: CryptoQuote) { if (book.onPrice(quote.symbol, quote.price)) save() }
+    @Synchronized fun onQuote(quote: CryptoQuote) {
+        val before = book.account.realizedPnl
+        if (book.onPrice(quote.symbol, quote.price)) {
+            save(); val delta = book.account.realizedPnl - before
+            if (delta.signum() != 0) CryptoStrategyService.getInstance().recordPaperOutcome(delta)
+        }
+    }
+    @Synchronized fun onClosedCandle(symbol: String, bar: KlineBar) {
+        val before = book.account.realizedPnl
+        if (book.onBar(symbol, bar)) {
+            save(); val delta = book.account.realizedPnl - before
+            if (delta.signum() != 0) CryptoStrategyService.getInstance().recordPaperOutcome(delta)
+        }
+    }
     @Synchronized fun reloadConfiguration() { book = newBook(book.account); save() }
     @Synchronized fun reset() { book = newBook(null); save() }
 
