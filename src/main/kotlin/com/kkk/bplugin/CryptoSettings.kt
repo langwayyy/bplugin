@@ -50,6 +50,8 @@ class CryptoSettings : PersistentStateComponent<CryptoSettings.Options> {
         var testnetMaxOrderPercent: Int = 100,
         var testnetMaxOrderNotional: String = "10000",
         var testnetMaxPriceDeviationPercent: Int = 5,
+        var testnetTradingEnabled: Boolean = true,
+        var testnetCloseOnly: Boolean = false,
     )
     private var options = Options()
     override fun getState() = options
@@ -148,6 +150,8 @@ class CryptoConfigurable : Configurable {
     private val testnetMaxOrderPercent = JSpinner(SpinnerNumberModel(100, 1, 100, 1))
     private val testnetMaxOrderNotional = JBTextField()
     private val testnetMaxPriceDeviationPercent = JSpinner(SpinnerNumberModel(5, 1, 100, 1))
+    private val testnetTradingEnabled = JBCheckBox("允许提交新的测试网订单")
+    private val testnetCloseOnly = JBCheckBox("仅减仓（禁止买入）")
     private val testnetConnection = JBLabel("仅连接 Binance Spot Testnet，不支持正式交易")
     private val testTestnet = JButton("测试测试网账户").apply { addActionListener {
         val key = testnetApiKey.text.trim(); val secret = String(testnetSecret.password)
@@ -196,6 +200,7 @@ class CryptoConfigurable : Configurable {
             .addLabeledComponent("测试网单笔最大仓位 %", testnetMaxOrderPercent)
             .addLabeledComponent("测试网单笔最大金额 USDT", testnetMaxOrderNotional)
             .addLabeledComponent("测试网限价最大偏离 %", testnetMaxPriceDeviationPercent)
+            .addComponent(testnetTradingEnabled).addComponent(testnetCloseOnly)
             .addComponent(JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply {
                 add(testTestnet); add(JButton("删除测试网凭据").apply { addActionListener {
                     BinanceTestnetCredentials.clear(); testnetApiKey.text = ""; testnetSecret.text = ""
@@ -212,13 +217,15 @@ class CryptoConfigurable : Configurable {
         alertsEnabled = alerts.isSelected, alertCooldownMinutes = alertCooldown.value as Int,
         paperInitialBalance = paperInitialBalance.text.trim(), paperFeeBps = paperFeeBps.value as Int,
         paperSlippageBps = paperSlippageBps.value as Int, tradingMode = (tradingMode.selectedItem as TradingAccountMode).name,
-        testnetApiKey = testnetApiKey.text.trim(), testnetMaxOrderPercent = testnetMaxOrderPercent.value as Int,
+        testnetApiKey = "", testnetMaxOrderPercent = testnetMaxOrderPercent.value as Int,
         testnetMaxOrderNotional = testnetMaxOrderNotional.text.trim(),
-        testnetMaxPriceDeviationPercent = testnetMaxPriceDeviationPercent.value as Int)
-    override fun isModified() = value() != CryptoSettings.getInstance().state || String(testnetSecret.password) != BinanceTestnetCredentials.secret()
+        testnetMaxPriceDeviationPercent = testnetMaxPriceDeviationPercent.value as Int,
+        testnetTradingEnabled = testnetTradingEnabled.isSelected, testnetCloseOnly = testnetCloseOnly.isSelected)
+    override fun isModified() = value() != CryptoSettings.getInstance().state ||
+        testnetApiKey.text.trim() != BinanceTestnetCredentials.apiKey() || String(testnetSecret.password) != BinanceTestnetCredentials.secret()
     override fun apply() {
         CryptoSettings.getInstance().loadState(value())
-        BinanceTestnetCredentials.save(String(testnetSecret.password))
+        BinanceTestnetCredentials.save(testnetApiKey.text.trim(), String(testnetSecret.password))
         CryptoPaperTradingService.getInstance().reloadConfiguration()
         CryptoTestnetTradingService.getInstance().credentialsChanged()
         CryptoMarketService.getInstance().refresh()
@@ -233,9 +240,10 @@ class CryptoConfigurable : Configurable {
         alerts.isSelected = s.alertsEnabled; alertCooldown.value = s.alertCooldownMinutes; updateAlertCount()
         paperInitialBalance.text = s.paperInitialBalance; paperFeeBps.value = s.paperFeeBps; paperSlippageBps.value = s.paperSlippageBps
         tradingMode.selectedItem = TradingAccountMode.entries.firstOrNull { it.name == s.tradingMode } ?: TradingAccountMode.LOCAL
-        testnetApiKey.text = s.testnetApiKey; testnetSecret.text = BinanceTestnetCredentials.secret()
+        testnetApiKey.text = BinanceTestnetCredentials.apiKey().ifBlank { s.testnetApiKey }; testnetSecret.text = BinanceTestnetCredentials.secret()
         testnetMaxOrderPercent.value = s.testnetMaxOrderPercent; testnetMaxOrderNotional.text = s.testnetMaxOrderNotional
         testnetMaxPriceDeviationPercent.value = s.testnetMaxPriceDeviationPercent
+        testnetTradingEnabled.isSelected = s.testnetTradingEnabled; testnetCloseOnly.isSelected = s.testnetCloseOnly
     }
     private fun updateAlertCount() { alertCount.text = "已配置 ${CryptoSettings.getInstance().alertRules().size} 条提醒  " }
 }

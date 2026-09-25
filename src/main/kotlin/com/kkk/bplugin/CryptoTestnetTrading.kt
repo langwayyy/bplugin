@@ -2,12 +2,17 @@ package com.kkk.bplugin
 
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
 import com.intellij.credentialStore.CredentialAttributes
 import com.intellij.credentialStore.Credentials
 import com.intellij.ide.passwordSafe.PasswordSafe
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.Service
+import com.intellij.openapi.components.PersistentStateComponent
+import com.intellij.openapi.components.State
+import com.intellij.openapi.components.Storage
 import com.intellij.util.concurrency.AppExecutorUtil
 import com.intellij.util.net.HttpConfigurable
 import java.net.Authenticator
@@ -63,16 +68,23 @@ data class TestnetExecutionEvent(
 )
 data class TestnetOcoDraft(val quantity: BigDecimal, val targetPrice: BigDecimal, val stopPrice: BigDecimal, val stopLimitPrice: BigDecimal)
 data class TestnetOrderListEvent(val orderListId: Long, val status: String, val time: Long)
+data class TestnetValidationResult(val symbol: String, val clientOrderId: String, val orderId: Long?,
+                                   val finalStatus: String, val message: String)
 
 object BinanceTestnetCredentials {
     private val attributes = CredentialAttributes("QuietCrypto.BinanceSpotTestnet.Secret")
+    fun apiKey(): String = PasswordSafe.instance.get(attributes)?.userName.orEmpty().takeUnless { it == "spot-testnet" }.orEmpty()
     fun secret(): String = PasswordSafe.instance.get(attributes)?.getPasswordAsString().orEmpty()
-    fun save(secret: String) { PasswordSafe.instance.set(attributes, secret.takeIf(String::isNotBlank)?.let { Credentials("spot-testnet", it) }) }
+    fun save(apiKey: String, secret: String) {
+        PasswordSafe.instance.set(attributes, if (apiKey.isNotBlank() && secret.isNotBlank()) Credentials(apiKey.trim(), secret) else null)
+    }
     fun clear() { PasswordSafe.instance.set(attributes, null) }
 }
 
 @Service(Service.Level.APP)
-class CryptoTestnetTradingService : Disposable {
+@State(name = "QuietCryptoTestnetOrders", storages = [Storage("quiet-crypto-testnet-orders.xml")])
+class CryptoTestnetTradingService : Disposable, PersistentStateComponent<CryptoTestnetTradingService.StoredState> {
+    data class StoredState(var ordersJson: String = "[]", var lastReconciledAt: Long = 0)
     private val client = BinanceTestnetClient()
     private val busy = AtomicBoolean()
     @Volatile private var pendingSymbol: String? = null
@@ -85,6 +97,8 @@ class CryptoTestnetTradingService : Disposable {
     @Volatile private var disposed = false
     @Volatile private var lastOrderFingerprint = ""
     @Volatile private var lastOrderAt = 0L
+    private var stored = StoredState()
+    private var ledger = TestnetOrderLedger()
     private val stream = BinanceTestnetUserStream(
         onEvent = { event -> if (event == null || !applyExecutionEvent(event)) refresh(pendingSymbol) },
         onListEvent = { event -> if (!applyOrderListEvent(event)) refresh(pendingSymbol) },
@@ -102,7 +116,13 @@ class CryptoTestnetTradingService : Disposable {
         if (now >= nextRefresh) refresh(pendingSymbol)
     }, 2, 5, TimeUnit.SECONDS)
 
-    fun hasCredentials() = CryptoSettings.getInstance().state.testnetApiKey.isNotBlank() && BinanceTestnetCredentials.secret().isNotBlank()
+    fun hasCredentials() = credentials() != null
+    @Synchronized fun managedOrders(): List<ManagedTestnetOrder> = ledger.snapshot()
+    @Synchronized fun lastReconciledAt(): Long = stored.lastReconciledAt
+    fun tradingEnabled() = CryptoSettings.getInstance().state.testnetTradingEnabled
+    fun closeOnly() = CryptoSettings.getInstance().state.testnetCloseOnly
+    fun setTradingEnabled(value: Boolean) { CryptoSettings.getInstance().state.testnetTradingEnabled = value }
+    fun setCloseOnly(value: Boolean) { CryptoSettings.getInstance().state.testnetCloseOnly = value }
     fun trackedSymbols(): List<String> = snapshot.balances.filter { it.asset != "USDT" && it.total.signum() > 0 }
         .map { "${it.asset}USDT" }.filter(::isCryptoSymbol).distinct()
 
@@ -127,6 +147,63 @@ class CryptoTestnetTradingService : Disposable {
         }
     }
 
+    fun validatePermissions(symbol: String, callback: (Result<TestnetValidationResult>) -> Unit) {
+        val credentials = credentials() ?: return callback(Result.failure(IllegalStateException("请先填写测试网 API Key 和 Secret")))
+        if (!busy.compareAndSet(false, true)) return callback(Result.failure(IllegalStateException("测试网请求正在处理中")))
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val result = runCatching {
+                client.synchronizeTime()
+                client.account(credentials.first, credentials.second)
+                val normalized = normalizeMarketSymbol(symbol)
+                val current = client.tickerPrice(normalized)
+                val rules = client.rules(normalized)
+                val price = rules.normalizePrice(current.multiply(BigDecimal("0.99")))
+                val quantity = rules.minimumQuantity(price)
+                val id = clientId("test", "$normalized|$quantity|$price|${System.currentTimeMillis()}")
+                client.testOrder(normalized, PaperOrderSide.BUY, quantity, price, id, credentials.first, credentials.second)
+                TestnetValidationResult(normalized, id, null, "TEST_ACCEPTED", "签名、交易权限和交易规则预检通过，未创建订单")
+            }
+            busy.set(false)
+            ApplicationManager.getApplication().invokeLater { callback(result) }
+        }
+    }
+
+    fun validateOrderRoundTrip(symbol: String, callback: (Result<TestnetValidationResult>) -> Unit) {
+        val credentials = credentials() ?: return callback(Result.failure(IllegalStateException("请先配置测试网凭据")))
+        tradingGuard(PaperOrderSide.BUY)?.let { return callback(Result.failure(IllegalStateException(it))) }
+        if (!busy.compareAndSet(false, true)) return callback(Result.failure(IllegalStateException("测试网请求正在处理中")))
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val result = runCatching {
+                requireFreshSnapshot()
+                val normalized = normalizeMarketSymbol(symbol)
+                val current = client.tickerPrice(normalized)
+                val rules = client.rules(normalized)
+                val deviation = minOf(CryptoSettings.getInstance().state.testnetMaxPriceDeviationPercent.toBigDecimal()
+                    .divide(BigDecimal(2)), BigDecimal.ONE).max(BigDecimal("0.1"))
+                val price = rules.normalizePrice(current.multiply(BigDecimal.ONE - deviation.movePointLeft(2)))
+                val quantity = rules.minimumQuantity(price)
+                validateRisk(normalized, PaperOrderSide.BUY, quantity, price, current)
+                val id = clientId("verify", "$normalized|$quantity|$price|${System.currentTimeMillis()}")
+                val placed = submitWithRecovery(id, normalized, PaperOrderSide.BUY, "LIMIT", quantity, credentials) {
+                    client.placeOrder(normalized, PaperOrderSide.BUY, PaperOrderType.LIMIT, quantity, price,
+                        credentials.first, credentials.second, id)
+                }
+                val queried = client.queryOrder(normalized, id, credentials.first, credentials.second)
+                synchronized(this) { ledger.merge(queried); saveLedger() }
+                val final = if (queried.status in setOf("NEW", "PARTIALLY_FILLED")) {
+                    client.cancelOrder(normalized, placed.id, credentials.first, credentials.second).also {
+                        synchronized(this) { ledger.merge(it); saveLedger() }
+                    }
+                } else queried
+                TestnetValidationResult(normalized, id, final.id, final.status,
+                    if (final.status == "FILLED") "验证订单已在撤销前成交" else "下单、按客户端 ID 查询和撤单链路通过")
+            }
+            busy.set(false)
+            result.onSuccess { refresh(symbol) }.onFailure { error = it.message }
+            ApplicationManager.getApplication().invokeLater { callback(result) }
+        }
+    }
+
     fun refresh(symbol: String? = null) {
         val normalized = symbol?.let(::normalizeMarketSymbol)?.takeIf(::isCryptoSymbol)
         if (normalized != null) pendingSymbol = normalized
@@ -136,13 +213,26 @@ class CryptoTestnetTradingService : Disposable {
             val result = runCatching {
                 val balances = client.account(credentials.first, credentials.second)
                 val orders = client.openOrders(credentials.first, credentials.second)
-                val history = pendingSymbol?.let { client.allOrders(it, credentials.first, credentials.second) }.orEmpty()
+                val symbols = synchronized(this) { (ledger.active().map(ManagedTestnetOrder::symbol) +
+                    listOfNotNull(pendingSymbol) + orders.map(TestnetOrder::symbol)).distinct().take(20) }
+                val histories = symbols.associateWith { client.allOrders(it, credentials.first, credentials.second) }
+                val history = pendingSymbol?.let { histories[it] }.orEmpty()
                 val trades = pendingSymbol?.let { client.trades(it, credentials.first, credentials.second) }.orEmpty()
                 val orderLists = client.openOrderLists(credentials.first, credentials.second)
-                TestnetSnapshot(balances, orders, history.filter { it.status !in setOf("NEW", "PARTIALLY_FILLED") }, trades, orderLists, Instant.now())
+                val next = TestnetSnapshot(balances, orders, history.filter { it.status !in setOf("NEW", "PARTIALLY_FILLED") }, trades, orderLists, Instant.now())
+                val newUncertain = synchronized(this) {
+                    val before = ledger.snapshot().count { it.state == ManagedOrderState.UNCERTAIN }
+                    ledger.reconcile(orders + histories.values.flatten())
+                    val count = (ledger.snapshot().count { it.state == ManagedOrderState.UNCERTAIN } - before).coerceAtLeast(0)
+                    stored.lastReconciledAt = System.currentTimeMillis()
+                    saveLedger()
+                    count
+                }
+                if (newUncertain > 0) CryptoNotifications.warn("测试网订单需要核对", "$newUncertain 条本地订单未能在币安状态中确认")
+                next
             }
             result.onSuccess { snapshot = it; error = null; retryAt = 0; nextRefresh = System.currentTimeMillis() + 30_000 }
-                .onFailure { error = it.message ?: "测试网账户同步失败"; retryAt = System.currentTimeMillis() + 15_000 }
+                .onFailure { error = it.message ?: "测试网账户同步失败"; retryAt = System.currentTimeMillis() + testnetRetryDelayMillis(it) }
             busy.set(false)
         }
     }
@@ -150,6 +240,7 @@ class CryptoTestnetTradingService : Disposable {
     fun place(symbol: String, side: PaperOrderSide, type: PaperOrderType, quantity: java.math.BigDecimal,
               price: java.math.BigDecimal?, callback: (Result<TestnetOrder>) -> Unit, requestedClientOrderId: String? = null) {
         val credentials = credentials() ?: return callback(Result.failure(IllegalStateException("请先配置测试网凭据")))
+        tradingGuard(side)?.let { return callback(Result.failure(IllegalStateException(it))) }
         if (!busy.compareAndSet(false, true)) return callback(Result.failure(IllegalStateException("测试网请求正在处理中")))
         ApplicationManager.getApplication().executeOnPooledThread {
             val result = runCatching {
@@ -166,7 +257,10 @@ class CryptoTestnetTradingService : Disposable {
                 val now = System.currentTimeMillis()
                 if (fingerprint == lastOrderFingerprint && now - lastOrderAt < 5_000) error("检测到重复订单，请稍后重试")
                 lastOrderFingerprint = fingerprint; lastOrderAt = now
-                client.placeOrder(symbol, side, type, quantity, price, credentials.first, credentials.second, requestedClientOrderId ?: clientId("ord", fingerprint))
+                val id = requestedClientOrderId ?: clientId("ord", fingerprint)
+                submitWithRecovery(id, symbol, side, type.name, quantity, credentials) {
+                    client.placeOrder(symbol, side, type, quantity, price, credentials.first, credentials.second, id)
+                }
             }
             busy.set(false)
             result.onSuccess { refresh(symbol) }.onFailure { error = it.message }
@@ -178,7 +272,10 @@ class CryptoTestnetTradingService : Disposable {
         val credentials = credentials() ?: return callback(Result.failure(IllegalStateException("请先配置测试网凭据")))
         if (!busy.compareAndSet(false, true)) return callback(Result.failure(IllegalStateException("测试网请求正在处理中")))
         ApplicationManager.getApplication().executeOnPooledThread {
-            val result = runCatching { client.cancelOrder(order.symbol, order.id, credentials.first, credentials.second) }
+            synchronized(this) { ledger.cancelPending(order.clientOrderId); saveLedger() }
+            val result = runCatching { client.cancelOrder(order.symbol, order.id, credentials.first, credentials.second).also {
+                synchronized(this) { ledger.merge(it); saveLedger() }
+            } }.onFailure { synchronized(this) { ledger.uncertain(order.clientOrderId, it.message); saveLedger() } }
             busy.set(false)
             result.onSuccess { refresh(order.symbol) }.onFailure { error = it.message }
             ApplicationManager.getApplication().invokeLater { callback(result) }
@@ -188,6 +285,7 @@ class CryptoTestnetTradingService : Disposable {
     fun placeConditional(symbol: String, side: PaperOrderSide, kind: TestnetOrderKind, quantity: BigDecimal,
                          triggerPrice: BigDecimal, limitPrice: BigDecimal, callback: (Result<TestnetOrder>) -> Unit) {
         val credentials = credentials() ?: return callback(Result.failure(IllegalStateException("请先配置测试网凭据")))
+        tradingGuard(side)?.let { return callback(Result.failure(IllegalStateException(it))) }
         if (kind !in setOf(TestnetOrderKind.STOP_LOSS_LIMIT, TestnetOrderKind.TAKE_PROFIT_LIMIT))
             return callback(Result.failure(IllegalArgumentException("条件订单类型无效")))
         if (!busy.compareAndSet(false, true)) return callback(Result.failure(IllegalStateException("测试网请求正在处理中")))
@@ -202,8 +300,11 @@ class CryptoTestnetTradingService : Disposable {
                 validateRisk(symbol, side, quantity, limitPrice, current)
                 val fingerprint = "${normalizeMarketSymbol(symbol)}|$side|$kind|$quantity|$triggerPrice|$limitPrice"
                 ensureUnique(fingerprint)
-                client.placeConditionalOrder(symbol, side, kind.name, quantity, triggerPrice, limitPrice,
-                    clientId("ord", fingerprint), credentials.first, credentials.second)
+                val id = clientId("ord", fingerprint)
+                submitWithRecovery(id, symbol, side, kind.name, quantity, credentials) {
+                    client.placeConditionalOrder(symbol, side, kind.name, quantity, triggerPrice, limitPrice,
+                        id, credentials.first, credentials.second)
+                }
             }
             busy.set(false); result.onSuccess { refresh(symbol) }.onFailure { error = it.message }
             ApplicationManager.getApplication().invokeLater { callback(result) }
@@ -214,6 +315,7 @@ class CryptoTestnetTradingService : Disposable {
                  stopPrice: BigDecimal, stopLimitPrice: BigDecimal, callback: (Result<TestnetOrderList>) -> Unit,
                  requestedClientOrderId: String? = null) {
         val credentials = credentials() ?: return callback(Result.failure(IllegalStateException("请先配置测试网凭据")))
+        tradingGuard(side)?.let { return callback(Result.failure(IllegalStateException(it))) }
         if (!busy.compareAndSet(false, true)) return callback(Result.failure(IllegalStateException("测试网请求正在处理中")))
         ApplicationManager.getApplication().executeOnPooledThread {
             val result = runCatching {
@@ -310,6 +412,7 @@ class CryptoTestnetTradingService : Disposable {
             openOrders = (snapshot.openOrders.filterNot { it.id == event.orderId } + if (active) listOf(updated) else emptyList()).sortedByDescending(TestnetOrder::time),
             history = (snapshot.history.filterNot { it.id == event.orderId } + if (active) emptyList() else listOf(updated)).sortedByDescending(TestnetOrder::time),
         )
+        ledger.merge(updated); saveLedger()
         return true
     }
     @Synchronized private fun applyOrderListEvent(event: TestnetOrderListEvent): Boolean {
@@ -331,6 +434,32 @@ class CryptoTestnetTradingService : Disposable {
             TestnetRiskPolicy(settings.testnetMaxOrderPercent, settings.testnetMaxOrderNotional.toBigDecimal(),
                 settings.testnetMaxPriceDeviationPercent))?.let { error(it) }
     }
+    private fun tradingGuard(side: PaperOrderSide): String? {
+        val settings = CryptoSettings.getInstance().state
+        return validateTestnetTradingGuard(settings.testnetTradingEnabled, settings.testnetCloseOnly, side)
+    }
+
+    private fun submitWithRecovery(clientOrderId: String, symbol: String, side: PaperOrderSide, rawType: String,
+                                   quantity: BigDecimal, credentials: Pair<String, String>, submit: () -> TestnetOrder): TestnetOrder {
+        synchronized(this) { ledger.submitting(clientOrderId, symbol, side, rawType, quantity); saveLedger() }
+        return try {
+            submit().also { synchronized(this) { ledger.merge(it); saveLedger() } }
+        } catch (failure: Throwable) {
+            val recovered = runCatching { client.queryOrder(symbol, clientOrderId, credentials.first, credentials.second) }.getOrNull()
+            if (recovered != null) {
+                synchronized(this) { ledger.merge(recovered); saveLedger() }
+                recovered
+            } else {
+                synchronized(this) {
+                    if (failure is BinanceTestnetException && failure.code in setOf(-1013, -2010, -2015))
+                        ledger.rejected(clientOrderId, failure.message)
+                    else ledger.uncertain(clientOrderId, failure.message)
+                    saveLedger()
+                }
+                throw failure
+            }
+        }
+    }
     private fun ensureUnique(fingerprint: String) {
         val now = System.currentTimeMillis()
         if (fingerprint == lastOrderFingerprint && now - lastOrderAt < 5_000) error("检测到重复订单，请稍后重试")
@@ -344,8 +473,15 @@ class CryptoTestnetTradingService : Disposable {
     }
 
     private fun credentials(): Pair<String, String>? {
-        val key = CryptoSettings.getInstance().state.testnetApiKey.trim()
+        val settings = CryptoSettings.getInstance().state
+        var key = BinanceTestnetCredentials.apiKey()
         val secret = BinanceTestnetCredentials.secret()
+        val legacyKey = settings.testnetApiKey.trim()
+        if (key.isBlank() && legacyKey.isNotBlank() && secret.isNotBlank()) {
+            BinanceTestnetCredentials.save(legacyKey, secret)
+            settings.testnetApiKey = ""
+            key = legacyKey
+        }
         return if (key.isBlank() || secret.isBlank()) null else key to secret
     }
     private fun ensureStream() {
@@ -353,10 +489,20 @@ class CryptoTestnetTradingService : Disposable {
         if (stream.isActive()) return
         ApplicationManager.getApplication().executeOnPooledThread {
             runCatching { client.synchronizeTime(); stream.ensure(credentials.first, credentials.second, client.timestamp()) }
-                .onFailure { streamConnected = false; streamMessage = it.message; retryAt = System.currentTimeMillis() + 15_000 }
+                .onFailure { streamConnected = false; streamMessage = it.message; retryAt = System.currentTimeMillis() + testnetRetryDelayMillis(it) }
         }
     }
     override fun dispose() { disposed = true; schedule.cancel(false); stream.close() }
+
+    override fun getState(): StoredState = stored
+    override fun loadState(state: StoredState) {
+        stored = state
+        val type = object : TypeToken<List<ManagedTestnetOrder>>() {}.type
+        val restored = runCatching { Gson().fromJson<List<ManagedTestnetOrder>>(state.ordersJson, type) }.getOrDefault(emptyList())
+            .filter { it.clientOrderId.isNotBlank() && isCryptoSymbol(it.symbol) }
+        synchronized(this) { ledger = TestnetOrderLedger(restored) }
+    }
+    private fun saveLedger() { stored.ordersJson = Gson().toJson(ledger.snapshot()) }
 
     companion object { fun getInstance() = ApplicationManager.getApplication().getService(CryptoTestnetTradingService::class.java) }
 }

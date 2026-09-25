@@ -26,4 +26,9 @@ class BinanceTestnetClientTest : TestCase() {
         assertEquals(BigDecimal("2"), rules.normalizeQuantity(BigDecimal("3.5")))
         assertEquals(BigDecimal("64250.12"), rules.normalizePrice(BigDecimal("64250.129")))
     }
+
+    fun testMinimumQuantityRoundsUpToNotionalAndStep() {
+        val rules = TestnetSymbolRules(BigDecimal("0.001"), BigDecimal("100"), BigDecimal("0.001"), BigDecimal("10"))
+        assertEquals(BigDecimal("0.102"), rules.minimumQuantity(BigDecimal("99")))
+    }
 }

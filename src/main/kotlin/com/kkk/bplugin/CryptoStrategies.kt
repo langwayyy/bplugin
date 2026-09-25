@@ -180,6 +180,8 @@ class CryptoStrategyService : PersistentStateComponent<CryptoStrategyService.Sto
         appendLine("测试网凭据: ${if (testnet.hasCredentials()) "已配置" else "未配置"}")
         val snapshotAge = testnet.snapshot.updatedAt?.let { java.time.Duration.between(it, Instant.now()).seconds.coerceAtLeast(0) }
         appendLine("测试网快照: ${testnet.snapshot.updatedAt ?: "—"}${snapshotAge?.let { " (${it}秒前)" }.orEmpty()}, 未完成订单: ${testnet.snapshot.openOrders.size}, 订单组: ${testnet.snapshot.orderLists.size}")
+        appendLine("测试网订单账本: ${testnet.managedOrders().size}, 待对账: ${testnet.managedOrders().count { it.state == ManagedOrderState.UNCERTAIN }}, 最后对账: ${testnet.lastReconciledAt().takeIf { it > 0 }?.let { Instant.ofEpochMilli(it) } ?: "—"}")
+        appendLine("测试网安全状态: ${if (testnet.tradingEnabled()) "允许新订单" else "已停止新订单"}${if (testnet.closeOnly()) "，仅减仓" else ""}")
         appendLine("策略: ${strategies.size}（启用 ${strategies.count(CryptoStrategyRule::enabled)}）, 待确认: ${drafts.size}")
         appendLine("执行: ${executions.size}, 结果未知: ${executions.count { it.state == StrategyExecutionState.UNKNOWN }}")
         appendLine("全局暂停: ${stored.paused}, 自动测试网: ${stored.testnetAutoEnabled}")

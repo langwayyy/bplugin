@@ -35,12 +35,19 @@ internal fun validateTestnetRisk(symbol: String, side: PaperOrderSide, quantity:
     val normalized = normalizeMarketSymbol(symbol)
     val notional = quantity * orderPrice
     if (notional > policy.maxNotional) return "订单金额 ${marketPrice(notional, 2)} USDT 超过风控上限 ${marketPrice(policy.maxNotional, 2)} USDT"
-    val available = if (side == PaperOrderSide.BUY) balances.firstOrNull { it.asset == "USDT" }?.free ?: BigDecimal.ZERO
-    else balances.firstOrNull { it.asset == normalized.removeSuffix("USDT") }?.free ?: BigDecimal.ZERO
+    val balance = if (side == PaperOrderSide.BUY) balances.firstOrNull { it.asset == "USDT" }
+    else balances.firstOrNull { it.asset == normalized.removeSuffix("USDT") }
+    val available = balance?.free ?: BigDecimal.ZERO
     val required = if (side == PaperOrderSide.BUY) notional else quantity
     if (available.signum() <= 0 || required > available) return if (side == PaperOrderSide.BUY) "USDT 可用余额不足" else "可卖资产余额不足"
-    val ratio = required.multiply(BigDecimal(100)).divide(available, 4, RoundingMode.HALF_UP)
-    if (ratio > BigDecimal(policy.maxPositionPercent)) return "订单占可用余额 ${marketPrice(ratio, 2)}%，超过风控上限 ${policy.maxPositionPercent}%"
+    val reserved = balance?.locked ?: BigDecimal.ZERO
+    val exposure = required + reserved
+    val total = available + reserved
+    val ratio = exposure.multiply(BigDecimal(100)).divide(total, 4, RoundingMode.HALF_UP)
+    if (ratio > BigDecimal(policy.maxPositionPercent)) return "当前订单与未完成委托合计占资产 ${marketPrice(ratio, 2)}%，超过风控上限 ${policy.maxPositionPercent}%"
+    val exposureNotional = if (side == PaperOrderSide.BUY) exposure else exposure * orderPrice
+    if (exposureNotional > policy.maxNotional)
+        return "当前订单与未完成委托合计 ${marketPrice(exposureNotional, 2)} USDT，超过风控上限 ${marketPrice(policy.maxNotional, 2)} USDT"
     if (currentPrice.signum() > 0) {
         val deviation = orderPrice.subtract(currentPrice).abs().multiply(BigDecimal(100)).divide(currentPrice, 4, RoundingMode.HALF_UP)
         if (deviation > BigDecimal(policy.maxPriceDeviationPercent))

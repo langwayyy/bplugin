@@ -68,6 +68,13 @@ data class TestnetSymbolRules(
         if (maxQuantity.signum() > 0) minOf(it, maxQuantity) else it
     }
     fun normalizePrice(value: BigDecimal): BigDecimal = normalizeStep(value, tickSize)
+    fun minimumQuantity(price: BigDecimal): BigDecimal {
+        val notionalQuantity = if (minNotional.signum() > 0 && price.signum() > 0)
+            minNotional.divide(price, 16, RoundingMode.UP) else BigDecimal.ZERO
+        val raw = maxOf(minQuantity, notionalQuantity)
+        return if (stepSize.signum() <= 0) raw.stripTrailingZeros()
+        else raw.divide(stepSize, 0, RoundingMode.UP).multiply(stepSize).stripTrailingZeros()
+    }
 
     fun validate(quantity: BigDecimal, price: BigDecimal?, validatePriceStep: Boolean = true): String? {
         if (quantity < minQuantity) return "数量不能小于 ${marketPrice(minQuantity)}"
@@ -113,6 +120,10 @@ class BinanceTestnetClient {
     fun allOrders(symbol: String, apiKey: String, secret: String): List<TestnetOrder> = parseOrders(
         signed("GET", "/api/v3/allOrders", mapOf("symbol" to normalizeMarketSymbol(symbol), "limit" to "50"), apiKey, secret).asJsonArray)
 
+    fun queryOrder(symbol: String, clientOrderId: String, apiKey: String, secret: String): TestnetOrder = parseOrder(
+        signed("GET", "/api/v3/order", mapOf("symbol" to normalizeMarketSymbol(symbol),
+            "origClientOrderId" to clientOrderId), apiKey, secret).asJsonObject)
+
     fun trades(symbol: String, apiKey: String, secret: String): List<TestnetTrade> =
         signed("GET", "/api/v3/myTrades", mapOf("symbol" to normalizeMarketSymbol(symbol), "limit" to "100"), apiKey, secret)
             .asJsonArray.map { row -> row.asJsonObject.let {
@@ -132,6 +143,14 @@ class BinanceTestnetClient {
             params["price"] = price.stripTrailingZeros().toPlainString()
         }
         return parseOrder(signed("POST", "/api/v3/order", params, apiKey, secret).asJsonObject)
+    }
+
+    fun testOrder(symbol: String, side: PaperOrderSide, quantity: BigDecimal, price: BigDecimal,
+                  clientOrderId: String, apiKey: String, secret: String) {
+        val params = linkedMapOf("symbol" to normalizeMarketSymbol(symbol), "side" to side.name, "type" to "LIMIT",
+            "quantity" to quantity.stripTrailingZeros().toPlainString(), "price" to price.stripTrailingZeros().toPlainString(),
+            "timeInForce" to "GTC", "newClientOrderId" to clientOrderId)
+        signed("POST", "/api/v3/order/test", params, apiKey, secret)
     }
 
     fun placeConditionalOrder(symbol: String, side: PaperOrderSide, rawType: String, quantity: BigDecimal,
@@ -266,7 +285,9 @@ class BinanceTestnetClient {
             -1022 -> "测试网签名无效，请检查 API Secret"
             -2010 -> "测试网拒绝订单：${message.orEmpty()}"
             -2011 -> "测试网委托不存在或已结束"
+            -2013 -> "测试网订单不存在"
             -2015 -> "测试网 API Key 无效或权限不足"
+            -1003 -> "测试网请求过于频繁，请稍后重试"
             else -> message?.take(240)?.takeIf(String::isNotBlank) ?: "币安测试网请求失败（HTTP $status）"
         }
     }

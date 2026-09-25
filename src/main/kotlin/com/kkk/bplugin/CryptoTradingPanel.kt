@@ -84,6 +84,11 @@ class CryptoTestnetPanel(private val project: Project?, initialSymbol: String?, 
     private val cancelAll = JButton("撤销该交易对全部委托")
     private val cancelList = JButton("撤销所选订单组")
     private val normalize = JButton("按规则取整")
+    private val safety = JBLabel()
+    private val tradingSwitch = JButton()
+    private val closeOnly = JCheckBox("仅减仓").apply { isSelected = service.closeOnly() }
+    private val preflight = JButton("交易权限预检")
+    private val roundTrip = JButton("实际下单验证")
     private val estimate = JBLabel("预计金额：—")
     private val message = JBLabel("测试网使用虚拟资产，订单会发送至 Binance Spot Testnet")
     private var balances = emptyList<TestnetBalance>()
@@ -91,6 +96,7 @@ class CryptoTestnetPanel(private val project: Project?, initialSymbol: String?, 
     private var history = emptyList<TestnetOrder>()
     private var trades = emptyList<TestnetTrade>()
     private var orderLists = emptyList<TestnetOrderList>()
+    private var managedOrders = emptyList<ManagedTestnetOrder>()
     private var fingerprint = ""
     private val balanceModel = object : AbstractTableModel() {
         override fun getRowCount() = balances.size
@@ -131,6 +137,16 @@ class CryptoTestnetPanel(private val project: Project?, initialSymbol: String?, 
             4 -> list.status; else -> list.orderIds.joinToString(", ")
         } }
     }
+    private val managedModel = object : AbstractTableModel() {
+        override fun getRowCount() = managedOrders.size
+        override fun getColumnCount() = 9
+        override fun getColumnName(column: Int) = arrayOf("更新时间", "交易对", "方向", "类型", "数量", "已成交", "本地状态", "订单 ID", "说明")[column]
+        override fun getValueAt(row: Int, column: Int): Any = managedOrders[row].let { order -> when (column) {
+            0 -> TIME.format(Instant.ofEpochMilli(order.updatedAt)); 1 -> order.symbol; 2 -> order.side.label; 3 -> rawTypeLabel(order.rawType)
+            4 -> marketPrice(order.quantity); 5 -> marketPrice(order.executedQuantity); 6 -> order.state.label
+            7 -> order.exchangeOrderId ?: "—"; else -> order.message.orEmpty()
+        } }
+    }
     private val orderTable = table(orderModel)
     private val historyTable = table(historyModel)
     private val listTable = table(listModel)
@@ -138,13 +154,20 @@ class CryptoTestnetPanel(private val project: Project?, initialSymbol: String?, 
 
     init {
         border = JBUI.Borders.empty(4)
-        add(JPanel(BorderLayout()).apply {
-            add(JPanel().apply {
-                layout = BoxLayout(this, BoxLayout.Y_AXIS)
-                add(JPanel(FlowLayout(FlowLayout.LEFT, 16, 0)).apply { add(assetSummary); add(updated) })
-                add(JPanel(FlowLayout(FlowLayout.LEFT, 16, 0)).apply { add(performanceSummary) })
-            }, BorderLayout.WEST)
-            add(JButton("同步账户").apply { addActionListener { service.refresh(selectedSymbol()); message.text = "正在同步测试网账户…" } }, BorderLayout.EAST)
+        add(JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            add(JPanel(BorderLayout()).apply {
+                add(JPanel().apply {
+                    layout = BoxLayout(this, BoxLayout.Y_AXIS)
+                    add(JPanel(FlowLayout(FlowLayout.LEFT, 16, 0)).apply { add(assetSummary); add(updated) })
+                    add(JPanel(FlowLayout(FlowLayout.LEFT, 16, 0)).apply { add(performanceSummary) })
+                }, BorderLayout.WEST)
+                add(JButton("同步并对账").apply { addActionListener { service.refresh(selectedSymbol()); message.text = "正在同步账户并核对本地订单…" } }, BorderLayout.EAST)
+            })
+            add(JPanel(FlowLayout(FlowLayout.LEFT)).apply {
+                add(safety); add(tradingSwitch); add(closeOnly); add(Box.createHorizontalStrut(JBUI.scale(12)))
+                add(preflight); add(roundTrip)
+            })
         }, BorderLayout.NORTH)
         add(JPanel(BorderLayout(0, JBUI.scale(8))).apply {
             add(JPanel().apply {
@@ -177,6 +200,7 @@ class CryptoTestnetPanel(private val project: Project?, initialSymbol: String?, 
                     add(scroll(listTable), BorderLayout.CENTER)
                     add(JPanel(FlowLayout(FlowLayout.RIGHT)).apply { add(cancelList) }, BorderLayout.SOUTH)
                 })
+                addTab("本地订单状态", scroll(table(managedModel)))
             }, BorderLayout.CENTER)
             add(message, BorderLayout.SOUTH)
         }, BorderLayout.CENTER)
@@ -187,6 +211,18 @@ class CryptoTestnetPanel(private val project: Project?, initialSymbol: String?, 
         cancelAll.addActionListener { cancelAll() }
         cancelList.addActionListener { cancelSelectedList() }
         normalize.addActionListener { prepareCurrent() }
+        tradingSwitch.addActionListener {
+            service.setTradingEnabled(!service.tradingEnabled())
+            message.text = if (service.tradingEnabled()) "已恢复测试网新订单" else "已停止所有新的测试网订单；撤单仍可使用"
+            fingerprint = ""
+        }
+        closeOnly.addActionListener {
+            service.setCloseOnly(closeOnly.isSelected)
+            message.text = if (closeOnly.isSelected) "已启用仅减仓模式：买入订单将被阻止" else "已关闭仅减仓模式"
+            fingerprint = ""
+        }
+        preflight.addActionListener { validatePermissions() }
+        roundTrip.addActionListener { validateRoundTrip() }
         symbol.addActionListener { service.refresh(selectedSymbol()); updateEstimate() }
         val documentListener = object : DocumentListener {
             override fun insertUpdate(e: DocumentEvent?) = updateEstimate()
@@ -276,6 +312,24 @@ class CryptoTestnetPanel(private val project: Project?, initialSymbol: String?, 
             message.text = result.fold({ "已撤销订单组 #${it.id}" }, { "订单组撤销失败：${it.message}" })
         }
     }
+    private fun validatePermissions() {
+        preflight.isEnabled = false; message.text = "正在验证签名、账户权限和交易规则（不会创建订单）…"
+        service.validatePermissions(selectedSymbol()) { result ->
+            preflight.isEnabled = true
+            message.text = result.fold({ it.message }, { "预检失败：${it.message}" })
+        }
+    }
+    private fun validateRoundTrip() {
+        val detail = "将使用测试网虚拟资产提交接近最小金额的限价买单，随后按客户端订单号查询并撤销。\n" +
+            "快速波动时订单可能在撤销前成交。是否继续？"
+        if (Messages.showYesNoDialog(project, detail, "确认实际测试网验证", null) != Messages.YES) return
+        roundTrip.isEnabled = false; message.text = "正在执行测试网下单、查询和撤单验证…"
+        service.validateOrderRoundTrip(selectedSymbol()) { result ->
+            roundTrip.isEnabled = true
+            message.text = result.fold({ "${it.message} · #${it.orderId ?: "—"} · ${statusLabel(it.finalStatus)}" },
+                { "实际验证失败：${it.message}" })
+        }
+    }
     private fun sizeByPercent(percent: Int) {
         prepare(BigDecimal(percent).movePointLeft(2), null)
     }
@@ -352,7 +406,8 @@ class CryptoTestnetPanel(private val project: Project?, initialSymbol: String?, 
         syncSymbols(null)
         updateEstimate()
         val snapshot = service.snapshot
-        val next = "$snapshot|${service.error}|${service.streamConnected}"
+        val local = service.managedOrders()
+        val next = "$snapshot|$local|${service.error}|${service.streamConnected}|${service.tradingEnabled()}|${service.closeOnly()}"
         if (next == fingerprint) return
         fingerprint = next
         balances = snapshot.balances.sortedWith(compareByDescending<TestnetBalance> { it.asset == "USDT" }.thenBy(TestnetBalance::asset))
@@ -360,7 +415,8 @@ class CryptoTestnetPanel(private val project: Project?, initialSymbol: String?, 
         history = snapshot.history
         trades = snapshot.trades
         orderLists = snapshot.orderLists
-        balanceModel.fireTableDataChanged(); orderModel.fireTableDataChanged(); historyModel.fireTableDataChanged(); tradeModel.fireTableDataChanged(); listModel.fireTableDataChanged()
+        managedOrders = local
+        balanceModel.fireTableDataChanged(); orderModel.fireTableDataChanged(); historyModel.fireTableDataChanged(); tradeModel.fireTableDataChanged(); listModel.fireTableDataChanged(); managedModel.fireTableDataChanged()
         val usdt = balances.firstOrNull { it.asset == "USDT" }
         val prices = market.quotes.mapValues { it.value.price }
         val equity = testnetEquityUsdt(balances, prices)
@@ -372,6 +428,13 @@ class CryptoTestnetPanel(private val project: Project?, initialSymbol: String?, 
         performanceSummary.text = "近100笔成交估算：持仓 ${marketPrice(performance.position)} · 成本 ${marketPrice(performance.averageCost)} · " +
             "已实现 ${signedPrice(performance.realizedPnl)} USDT · 未实现 ${signedPrice(performance.unrealizedPnl)} USDT · 手续费 $feeText"
         updated.text = snapshot.updatedAt?.let { "更新：${TIME.format(it)}" } ?: "尚未同步"
+        safety.text = when {
+            !service.tradingEnabled() -> "● 新订单已停止"
+            service.closeOnly() -> "● 仅减仓"
+            else -> "● 允许测试网下单"
+        }
+        tradingSwitch.text = if (service.tradingEnabled()) "停止新订单" else "恢复新订单"
+        if (closeOnly.isSelected != service.closeOnly()) closeOnly.isSelected = service.closeOnly()
         updateEstimate()
         service.error?.let { message.text = "同步失败：$it" }
     }

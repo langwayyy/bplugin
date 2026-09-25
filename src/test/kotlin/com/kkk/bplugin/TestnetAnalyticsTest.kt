@@ -31,6 +31,14 @@ class TestnetAnalyticsTest : TestCase() {
             balances, TestnetRiskPolicy(100, BigDecimal("1000"), 5)))
     }
 
+    fun testRiskCountsLockedBalanceAsPendingExposure() {
+        val balances = listOf(TestnetBalance("USDT", BigDecimal("600"), BigDecimal("400")))
+        val result = validateTestnetRisk("BTCUSDT", PaperOrderSide.BUY, BigDecimal("2"), BigDecimal("100"), BigDecimal("100"),
+            balances, TestnetRiskPolicy(50, BigDecimal("1000"), 5))
+        assertNotNull(result)
+        assertTrue(result!!.contains("未完成委托"))
+    }
+
     fun testConditionalAndOcoPriceDirections() {
         val current = BigDecimal("100")
         assertNull(validateConditionalTrigger(TestnetOrderKind.STOP_LOSS_LIMIT, PaperOrderSide.SELL, BigDecimal("95"), current))
