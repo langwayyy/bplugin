@@ -64,7 +64,8 @@ class CryptoMarketService : Disposable {
         if (!s.enabled || disposed) return
         if (!busy.compareAndSet(false, true)) { refreshPending = true; return }
         val symbols = (s.watchlist + s.statusSymbols + s.selected + CryptoPaperTradingService.getInstance().trackedSymbols() +
-            CryptoStrategyService.getInstance().trackedSymbols() + CryptoTestnetTradingService.getInstance().trackedSymbols()).filter(::isCryptoSymbol).distinct()
+            CryptoStrategyService.getInstance().trackedSymbols() + ForwardTestService.getInstance().trackedSymbols() +
+            CryptoTestnetTradingService.getInstance().trackedSymbols()).filter(::isCryptoSymbol).distinct()
         ApplicationManager.getApplication().executeOnPooledThread {
             val result = runCatching {
                 val catalog = if (pairs.isEmpty() || catalogUpdated.plusSeconds(3600).isBefore(Instant.now())) BinanceMarketClient.shared.pairs() else pairs
@@ -123,7 +124,8 @@ class CryptoMarketService : Disposable {
         val aged = stream.connectedAt?.let { Duration.between(it, Instant.now()).toMinutes() >= 1_435 } == true
         if (stale || aged) stream.disconnect(if (stale) "实时行情超时，正在重连" else "实时连接定期重建")
         val symbols = (s.watchlist + s.statusSymbols + s.selected + CryptoPaperTradingService.getInstance().trackedSymbols() +
-            CryptoStrategyService.getInstance().trackedSymbols() + CryptoTestnetTradingService.getInstance().trackedSymbols()).filter(::isCryptoSymbol).distinct().take(100)
+            CryptoStrategyService.getInstance().trackedSymbols() + ForwardTestService.getInstance().trackedSymbols() +
+            CryptoTestnetTradingService.getInstance().trackedSymbols()).filter(::isCryptoSymbol).distinct().take(100)
         if (symbols.isNotEmpty()) stream.ensure(StreamSpec(symbols, s.selected, CryptoSettings.getInstance().period()))
     }
     private fun stopRealtime(message: String?) {

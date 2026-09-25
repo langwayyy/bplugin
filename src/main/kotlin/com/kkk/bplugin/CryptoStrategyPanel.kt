@@ -104,6 +104,7 @@ class CryptoStrategyPanel(private val project: Project?) : JPanel(BorderLayout(0
     private val executionTable = table(executionModel)
     private val timer = Timer(1_000) { render() }
     private val backtest = StrategyBacktestPanel(project)
+    private val forward = ForwardTestingPanel(project) { selectedRule() }
     private val diagnostics = JTextArea().apply { isEditable = false; lineWrap = false; font = UIManager.getFont("TextArea.font") }
 
     init {
@@ -141,6 +142,7 @@ class CryptoStrategyPanel(private val project: Project?) : JPanel(BorderLayout(0
             })
             addTab("执行状态", JBScrollPane(executionTable))
             addTab("回测报告", backtest)
+            addTab("前向验证", forward)
             addTab("运行诊断", JPanel(BorderLayout()).apply {
                 add(JBScrollPane(diagnostics), BorderLayout.CENTER)
                 add(JPanel(FlowLayout(FlowLayout.RIGHT)).apply {
@@ -234,6 +236,7 @@ class CryptoStrategyPanel(private val project: Project?) : JPanel(BorderLayout(0
         status.text = "${if (service.isPaused()) "已暂停" else if (riskPause.isNotBlank()) "风控暂停：$riskPause" else "运行中"} · 自动测试网 ${if (service.isTestnetAutoEnabled()) "已开启" else "已关闭"} · 每日 ${limits.first} 次 · 未完成订单 ${limits.second} 个"
         status.foreground = if (service.isPaused()) JBColor(0xB05A00, 0xE6A04A) else JBColor(0x2A7D4F, 0x63C68B)
         diagnostics.text = service.diagnostics()
+        forward.refresh()
     }
     private fun showHint(value: String) { hint.text = value }
     private fun table(model: AbstractTableModel) = JBTable(model).apply { rowHeight = JBUI.scale(28); setShowGrid(false); autoCreateRowSorter = true; setSelectionMode(ListSelectionModel.SINGLE_SELECTION) }

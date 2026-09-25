@@ -48,6 +48,17 @@ class CryptoUiTest : BasePlatformTestCase() {
     fun testChartCloseButtonEscapeAndReopenReleaseViewers() {
         verifyChartCloseLifecycle()
     }
+    fun testForwardDashboardRenders() {
+        val service = ForwardTestService.getInstance()
+        val before = service.state.copy()
+        val rule = CryptoStrategyRule(name = "影子验证", symbol = "BTCUSDT", condition = StrategyCondition.PRICE_ABOVE,
+            threshold = BigDecimal("100"), budgetUsdt = BigDecimal("1000"))
+        try {
+            service.loadState(ForwardTestService.StoredState())
+            service.start(rule, ForwardStage.SHADOW).getOrThrow()
+            UIUtil.invokeAndWaitIfNeeded { render(ForwardTestingPanel(project) { rule }, "forward-testing", 1120, 560) }
+        } finally { service.loadState(before) }
+    }
     private fun verifyChartCloseLifecycle() {
         val settings = CryptoSettings.getInstance()
         val before = settings.state.copy()

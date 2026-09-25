@@ -413,6 +413,7 @@ class CryptoTestnetTradingService : Disposable, PersistentStateComponent<CryptoT
             history = (snapshot.history.filterNot { it.id == event.orderId } + if (active) emptyList() else listOf(updated)).sortedByDescending(TestnetOrder::time),
         )
         ledger.merge(updated); saveLedger()
+        CryptoStrategyService.getInstance().recordTestnetOrderUpdate(updated)
         return true
     }
     @Synchronized private fun applyOrderListEvent(event: TestnetOrderListEvent): Boolean {

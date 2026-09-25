@@ -278,14 +278,14 @@ class CryptoPaperTradingService : PersistentStateComponent<CryptoPaperTradingSer
         val before = book.account.realizedPnl
         if (book.onPrice(quote.symbol, quote.price)) {
             save(); val delta = book.account.realizedPnl - before
-            if (delta.signum() != 0) CryptoStrategyService.getInstance().recordPaperOutcome(delta)
+            if (delta.signum() != 0) { CryptoStrategyService.getInstance().recordPaperOutcome(delta); ForwardTestService.getInstance().recordOutcome(quote.symbol, ForwardStage.PAPER, delta) }
         }
     }
     @Synchronized fun onClosedCandle(symbol: String, bar: KlineBar) {
         val before = book.account.realizedPnl
         if (book.onBar(symbol, bar)) {
             save(); val delta = book.account.realizedPnl - before
-            if (delta.signum() != 0) CryptoStrategyService.getInstance().recordPaperOutcome(delta)
+            if (delta.signum() != 0) { CryptoStrategyService.getInstance().recordPaperOutcome(delta); ForwardTestService.getInstance().recordOutcome(symbol, ForwardStage.PAPER, delta) }
         }
     }
     @Synchronized fun reloadConfiguration() { book = newBook(book.account); save() }
