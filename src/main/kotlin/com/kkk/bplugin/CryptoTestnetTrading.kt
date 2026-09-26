@@ -231,7 +231,10 @@ class CryptoTestnetTradingService : Disposable, PersistentStateComponent<CryptoT
                 if (newUncertain > 0) CryptoNotifications.warn("测试网订单需要核对", "$newUncertain 条本地订单未能在币安状态中确认")
                 next
             }
-            result.onSuccess { snapshot = it; error = null; retryAt = 0; nextRefresh = System.currentTimeMillis() + 30_000 }
+            result.onSuccess {
+                snapshot = it; error = null; retryAt = 0; nextRefresh = System.currentTimeMillis() + 30_000
+                CryptoStrategyService.getInstance().reconcileTestnetSnapshot(it, CryptoMarketService.getInstance().quotes.mapValues { entry -> entry.value.price })
+            }
                 .onFailure { error = it.message ?: "测试网账户同步失败"; retryAt = System.currentTimeMillis() + testnetRetryDelayMillis(it) }
             busy.set(false)
         }

@@ -5,6 +5,14 @@ import java.math.BigDecimal
 import java.math.RoundingMode
 
 class TestnetAnalyticsTest : TestCase() {
+    fun testTradeFeeConvertsBaseAndQuoteAssetsToUsdt() {
+        assertEquals(0, testnetTradeFeeUsdt(trade(1, true, "100", "1", "100", "0.2", "USDT"), emptyMap())!!
+            .compareTo(BigDecimal("0.2")))
+        assertEquals(0, testnetTradeFeeUsdt(trade(2, true, "100", "1", "100", "0.001", "BTC"), emptyMap())!!
+            .compareTo(BigDecimal("0.1")))
+        assertEquals(0, testnetTradeFeeUsdt(trade(3, true, "100", "1", "100", "0.01", "BNB"),
+            mapOf("BNBUSDT" to BigDecimal("300")))!!.compareTo(BigDecimal("3")))
+    }
     fun testPerformanceUsesNetFeesAndWeightedCost() {
         val trades = listOf(
             trade(1, true, "100", "2", "200", "0.01", "BTC"),

@@ -84,6 +84,21 @@ class ForwardTestingTest : TestCase() {
         assertFalse(forwardRuleFingerprint(source) == forwardRuleFingerprint(source.copy(budgetUsdt = BigDecimal("1001"))))
     }
 
+    fun testLateFeeAttributionReducesEquityWithoutCreatingAnotherFill() {
+        val bought = ForwardEngine.attributeFill(session(rule()), PaperOrderSide.BUY, BigDecimal("100"), BigDecimal.ONE)
+        val adjusted = ForwardEngine.attributeFee(bought, PaperOrderSide.BUY, BigDecimal("0.1"))
+        assertEquals(0, adjusted.totalFees.compareTo(BigDecimal("0.1")))
+        assertEquals(0, adjusted.currentEquity.compareTo(bought.currentEquity - BigDecimal("0.1")))
+        assertTrue(adjusted.averageCost > bought.averageCost)
+    }
+
+    fun testZeroFeeStreamUpdateDoesNotResetReconciledCumulativeFee() {
+        val delta = forwardExecutionDelta(BigDecimal("1"), BigDecimal("2"), BigDecimal("0.1"), BigDecimal.ZERO)
+        assertEquals(0, delta.quantity.compareTo(BigDecimal.ONE))
+        assertEquals(0, delta.fee.compareTo(BigDecimal.ZERO))
+        assertEquals(0, delta.recordedFee.compareTo(BigDecimal("0.1")))
+    }
+
     fun testExportContainsMetricsButNoCredentialFields() {
         val session = session(rule()).copy(status = ForwardSessionStatus.COMPLETED, endedAt = 2_000)
         val event = ForwardEvent(sessionId = session.id, time = 1, type = ForwardEventType.ERROR, stage = ForwardStage.SHADOW,

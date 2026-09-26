@@ -519,11 +519,18 @@ class CryptoStrategyService : PersistentStateComponent<CryptoStrategyService.Sto
         portfolioRuntime = decision.runtime; encode()
         return decision.reason.takeIf(String::isNotBlank)
     }
-    @Synchronized fun recordTestnetOrderUpdate(order: TestnetOrder) {
+    @Synchronized fun recordTestnetOrderUpdate(order: TestnetOrder, feeUsdt: BigDecimal = BigDecimal.ZERO) {
         val execution = executions.firstOrNull { it.clientOrderId.isNotBlank() &&
             (order.clientOrderId == it.clientOrderId || order.clientOrderId.startsWith("${it.clientOrderId}-")) } ?: return
         ForwardTestService.getInstance().recordExecutionUpdate(execution.strategyId, execution.id, order.status, order.side,
-            order.averagePrice ?: order.price.takeIf { it.signum() > 0 }, order.executedQuantity)
+            order.averagePrice ?: order.price.takeIf { it.signum() > 0 }, order.executedQuantity, feeUsdt)
+    }
+    @Synchronized fun reconcileTestnetSnapshot(snapshot: TestnetSnapshot, prices: Map<String, BigDecimal>) {
+        val tradesByOrder = snapshot.trades.groupBy(TestnetTrade::orderId)
+        (snapshot.openOrders + snapshot.history).distinctBy(TestnetOrder::id).forEach { order ->
+            val fees = tradesByOrder[order.id].orEmpty().mapNotNull { testnetTradeFeeUsdt(it, prices) }
+            recordTestnetOrderUpdate(order, fees.fold(BigDecimal.ZERO, BigDecimal::add))
+        }
     }
     @Synchronized fun recordPaperOrderUpdate(order: PaperOrder) {
         if (order.status != PaperOrderStatus.FILLED || order.fillPrice == null) return

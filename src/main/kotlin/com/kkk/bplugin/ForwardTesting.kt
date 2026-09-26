@@ -69,6 +69,7 @@ data class ForwardSession(
     val targetPrice: BigDecimal? = null,
     val stopPrice: BigDecimal? = null,
     val executionQuantities: Map<String, String>? = emptyMap(),
+    val executionFees: Map<String, String>? = emptyMap(),
     val terminalExecutions: Set<String>? = emptySet(),
     val equityCurve: List<ForwardPoint> = emptyList(),
 )
@@ -118,6 +119,12 @@ data class ForwardMetrics(
     val errorRatePercent: BigDecimal, val fillRatePercent: BigDecimal,
 )
 data class ForwardTransition(val session: ForwardSession, val events: List<ForwardEvent> = emptyList())
+data class ForwardExecutionDelta(val quantity: BigDecimal, val fee: BigDecimal, val recordedFee: BigDecimal)
+internal fun forwardExecutionDelta(previousQuantity: BigDecimal, executedQuantity: BigDecimal,
+                                   previousFee: BigDecimal, cumulativeFee: BigDecimal) = ForwardExecutionDelta(
+    (executedQuantity - previousQuantity).max(BigDecimal.ZERO),
+    (cumulativeFee - previousFee).max(BigDecimal.ZERO),
+    maxOf(previousFee, cumulativeFee))
 
 internal object ForwardEngine {
     private val HUNDRED = BigDecimal("100")
@@ -209,7 +216,7 @@ internal object ForwardEngine {
             val nextQuantity = source.quantity + quantity
             val average = (source.averageCost * source.quantity + price * quantity + fee).divide(nextQuantity, 16, RoundingMode.HALF_UP)
             return markExternal(source.copy(cash = source.cash - price * quantity - fee, quantity = nextQuantity,
-                averageCost = average, totalFees = source.totalFees + fee), source.currentEquity, now)
+                averageCost = average, totalFees = source.totalFees + fee), (source.currentEquity - fee).max(BigDecimal.ZERO), now)
         }
         val sold = minOf(quantity, source.quantity)
         if (sold.signum() <= 0) return source
@@ -219,6 +226,18 @@ internal object ForwardEngine {
             averageCost = if (remaining.signum() == 0) BigDecimal.ZERO else source.averageCost,
             realizedPnl = source.realizedPnl + pnl, totalFees = source.totalFees + fee)
         return markExternal(next, source.initialEquity + next.realizedPnl, now)
+    }
+
+    fun attributeFee(source: ForwardSession, side: PaperOrderSide, fee: BigDecimal,
+                     now: Long = System.currentTimeMillis()): ForwardSession {
+        if (fee.signum() <= 0) return source
+        val next = if (side == PaperOrderSide.BUY && source.quantity.signum() > 0) {
+            source.copy(cash = (source.cash - fee).max(BigDecimal.ZERO),
+                averageCost = (source.averageCost * source.quantity + fee).divide(source.quantity, 16, RoundingMode.HALF_UP),
+                totalFees = source.totalFees + fee)
+        } else source.copy(cash = (source.cash - fee).max(BigDecimal.ZERO), realizedPnl = source.realizedPnl - fee,
+            totalFees = source.totalFees + fee)
+        return markExternal(next, (source.currentEquity - fee).max(BigDecimal.ZERO), now)
     }
 
     private fun fill(source: ForwardSession, side: PaperOrderSide, rawPrice: BigDecimal, requested: BigDecimal,
@@ -348,6 +367,7 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
         sessions = decodeList<ForwardSession>(state.sessionsJson).take(100).map { session ->
             session.copy(healthPauseReason = runCatching { session.healthPauseReason }.getOrNull().orEmpty(),
                 executionQuantities = session.executionQuantities.orEmpty(), terminalExecutions = session.terminalExecutions.orEmpty(),
+                executionFees = session.executionFees.orEmpty(),
                 lineageId = runCatching { session.lineageId }.getOrNull().orEmpty().ifBlank { session.id },
                 snapshotHash = runCatching { session.snapshotHash }.getOrNull().orEmpty().ifBlank { forwardRuleFingerprint(session.ruleSnapshot) })
         }.toMutableList()
@@ -528,13 +548,22 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
                                             sourceLabel: String = "测试网") {
         val source = sessionFor(strategyId) ?: return
         val previous = source.executionQuantities.orEmpty()[executionId]?.toBigDecimalOrNull() ?: BigDecimal.ZERO
-        val delta = (executedQuantity - previous).max(BigDecimal.ZERO)
+        val previousFee = source.executionFees.orEmpty()[executionId]?.toBigDecimalOrNull() ?: BigDecimal.ZERO
+        val deltaResult = forwardExecutionDelta(previous, executedQuantity, previousFee, fee)
+        val delta = deltaResult.quantity
+        val feeDelta = deltaResult.fee
+        val recordedFee = deltaResult.recordedFee
         var next = source
         if (delta.signum() > 0) {
             next = next.copy(fills = next.fills + if (previous.signum() == 0) 1 else 0,
-                executionQuantities = next.executionQuantities.orEmpty() + (executionId to executedQuantity.toPlainString()))
-            if (price != null) next = ForwardEngine.attributeFill(next, side, price, delta, fee)
-            replace(next); record(event(next, ForwardEventType.FILL, "$sourceLabel 成交：$status", executionId, price, delta, fee = fee))
+                executionQuantities = next.executionQuantities.orEmpty() + (executionId to executedQuantity.toPlainString()),
+                executionFees = next.executionFees.orEmpty() + (executionId to recordedFee.toPlainString()))
+            if (price != null) next = ForwardEngine.attributeFill(next, side, price, delta, feeDelta)
+            replace(next); record(event(next, ForwardEventType.FILL, "$sourceLabel 成交：$status", executionId, price, delta, fee = feeDelta))
+        } else if (feeDelta.signum() > 0) {
+            next = ForwardEngine.attributeFee(next, side, feeDelta).copy(
+                executionFees = next.executionFees.orEmpty() + (executionId to recordedFee.toPlainString()))
+            replace(next); record(event(next, ForwardEventType.FILL, "$sourceLabel 手续费补记", executionId, price, fee = feeDelta))
         }
         if (status == "REJECTED" && executionId !in next.terminalExecutions.orEmpty()) {
             next = next.copy(errors = next.errors + 1, consecutiveErrors = next.consecutiveErrors + 1,

@@ -97,3 +97,13 @@ internal fun testnetEquityUsdt(balances: List<TestnetBalance>, prices: Map<Strin
             else -> prices["${balance.asset}USDT"]?.multiply(balance.total) ?: BigDecimal.ZERO
         }
     }
+
+internal fun testnetTradeFeeUsdt(trade: TestnetTrade, prices: Map<String, BigDecimal>): BigDecimal? {
+    if (trade.commission.signum() <= 0) return BigDecimal.ZERO
+    val asset = trade.commissionAsset.uppercase()
+    return when {
+        asset == "USDT" -> trade.commission
+        trade.symbol.endsWith("USDT") && asset == trade.symbol.removeSuffix("USDT") -> trade.commission * trade.price
+        else -> prices["${asset}USDT"]?.let { trade.commission * it }
+    }
+}
