@@ -338,7 +338,7 @@ internal class ForwardEventJournal(private val root: Path, private val retention
         Files.writeString(root.resolve("$date.jsonl"), gson.toJson(event) + System.lineSeparator(), StandardCharsets.UTF_8,
             StandardOpenOption.CREATE, StandardOpenOption.APPEND)
     }
-    fun purge(today: LocalDate = LocalDate.now()) {
+    @Synchronized fun purge(today: LocalDate = LocalDate.now()) {
         if (!Files.exists(root)) return
         Files.list(root).use { paths -> paths.filter { it.fileName.toString().endsWith(".jsonl") }.forEach { path ->
             val date = path.fileName.toString().removeSuffix(".jsonl").let { runCatching { LocalDate.parse(it) }.getOrNull() }
@@ -353,11 +353,18 @@ internal class ForwardEventJournal(private val root: Path, private val retention
         var date = to
         while (!date.isBefore(from) && result.size < limit) {
             val path = root.resolve("$date.jsonl")
-            if (Files.isRegularFile(path)) Files.readAllLines(path, StandardCharsets.UTF_8).asReversed().forEach { line ->
-                if (result.size >= limit) return@forEach
-                val event = runCatching { gson.fromJson(line, ForwardEvent::class.java) }.getOrNull() ?: return@forEach
-                if (event.id !in seen && (sessionId == null || event.sessionId == sessionId) &&
-                    (types.isEmpty() || event.type in types)) { seen += event.id; result += event }
+            if (Files.isRegularFile(path)) {
+                val capacity = limit - result.size
+                val day = ArrayDeque<ForwardEvent>(capacity.coerceAtLeast(1))
+                Files.newBufferedReader(path, StandardCharsets.UTF_8).useLines { lines -> lines.forEach { line ->
+                    val event = runCatching { gson.fromJson(line, ForwardEvent::class.java) }.getOrNull() ?: return@forEach
+                    if ((sessionId == null || event.sessionId == sessionId) && (types.isEmpty() || event.type in types)) {
+                        day.addLast(event); if (day.size > capacity) day.removeFirst()
+                    }
+                } }
+                day.reversed().forEach { event ->
+                    if (result.size < limit && seen.add(event.id)) result += event
+                }
             }
             date = date.minusDays(1)
         }
@@ -401,10 +408,11 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
     private var healthPolicy = ForwardHealthPolicy()
     private var pendingJournal = mutableListOf<ForwardEvent>()
     private var journalError: String? = null
+    private var lastJournalPurge = LocalDate.MIN
     private var lastEncodedAt = 0L
     private val journal by lazy { ForwardEventJournal(Path.of(PathManager.getSystemPath(), "quiet-crypto", "forward-events")) }
 
-    init { runCatching { journal.purge() } }
+    init { runCatching { journal.purge() }.onSuccess { lastJournalPurge = LocalDate.now() } }
     @Synchronized override fun getState(): StoredState = stored.apply { encode() }
     @Synchronized override fun loadState(state: StoredState) {
         stored = state
@@ -530,6 +538,11 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
         encode(false)
     }
     @Synchronized fun checkHealth(now: Long = System.currentTimeMillis()) {
+        val today = Instant.ofEpochMilli(now).atZone(ZoneId.systemDefault()).toLocalDate()
+        if (today != lastJournalPurge) {
+            runCatching { journal.purge(today) }.onSuccess { lastJournalPurge = today }
+                .onFailure { journalError = it.message ?: it.javaClass.simpleName }
+        }
         var changed = false
         sessions.filter { it.status == ForwardSessionStatus.RUNNING }.toList().forEach { source ->
             val stale = forwardStaleMillis(source, now)

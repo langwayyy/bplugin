@@ -123,6 +123,19 @@ class ForwardTestingTest : TestCase() {
         assertEquals(listOf("new", "same"), mergeForwardEvents(listOf(newer, base), listOf(base)).map(ForwardEvent::id))
     }
 
+    fun testJournalReadKeepsNewestEventsWithinLimit() {
+        val root = Files.createTempDirectory("quiet-forward-limit")
+        try {
+            val journal = ForwardEventJournal(root)
+            val base = LocalDate.now().atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+            (1L..20L).forEach { time -> journal.append(ForwardEvent(id = "e$time", sessionId = "s", time = base + time,
+                type = ForwardEventType.SIGNAL, stage = ForwardStage.SHADOW, strategyId = "r",
+                strategyName = "rule", symbol = "BTCUSDT")) }
+            val loaded = journal.read(LocalDate.now(), LocalDate.now(), limit = 3)
+            assertEquals(listOf("e20", "e19", "e18"), loaded.map(ForwardEvent::id))
+        } finally { root.toFile().deleteRecursively() }
+    }
+
     fun testExportContainsMetricsButNoCredentialFields() {
         val session = session(rule()).copy(status = ForwardSessionStatus.COMPLETED, endedAt = 2_000)
         val event = ForwardEvent(sessionId = session.id, time = 1, type = ForwardEventType.ERROR, stage = ForwardStage.SHADOW,
