@@ -188,7 +188,7 @@ class ForwardTestingPanel(private val project: Project?, private val ruleProvide
         if (item == null) { summary.text = "尚无前向验证会话"; return }
         val metrics = ForwardEngine.metrics(item)
         val health = item.healthPauseReason.takeIf(String::isNotBlank)?.let { " · 暂停原因 $it" }.orEmpty()
-        summary.text = "${item.strategyName} · ${item.stage.label} · ${item.status.label} · 快照 ${item.snapshotHash.take(12)} · 归因盈亏 ${marketPrice(metrics.pnl, 2)} · 手续费 ${marketPrice(item.totalFees, 2)} · 滑点 ${marketPrice(item.totalSlippage, 2)} · 回撤 ${marketPrice(item.maxDrawdownPercent, 2)}% · 在线率 ${marketPrice(metrics.uptimePercent, 2)}% · 错误率 ${marketPrice(metrics.errorRatePercent, 2)}%$health"
+        summary.text = "${item.strategyName} · ${item.stage.label} · ${item.status.label} · 快照 ${item.snapshotHash.take(12)} · 归因盈亏 ${marketPrice(metrics.pnl, 2)} · 胜率 ${marketPrice(metrics.winRatePercent, 2)}% · PF ${marketPrice(metrics.profitFactor, 2)} · 单笔期望 ${marketPrice(metrics.expectancy, 2)} · 手续费 ${marketPrice(item.totalFees, 2)} · 回撤 ${marketPrice(item.maxDrawdownPercent, 2)}% · 在线率 ${marketPrice(metrics.uptimePercent, 2)}% · 错误率 ${marketPrice(metrics.errorRatePercent, 2)}%$health"
     }
     private fun message(value: String) { summary.text = value }
     private fun table(model: AbstractTableModel) = JBTable(model).apply { rowHeight = JBUI.scale(28); setShowGrid(false); autoCreateRowSorter = true; setSelectionMode(ListSelectionModel.SINGLE_SELECTION) }

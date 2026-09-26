@@ -51,6 +51,11 @@ data class ForwardSession(
     val quantity: BigDecimal = BigDecimal.ZERO,
     val averageCost: BigDecimal = BigDecimal.ZERO,
     val realizedPnl: BigDecimal = BigDecimal.ZERO,
+    val closedTrades: Int = 0,
+    val winningTrades: Int = 0,
+    val losingTrades: Int = 0,
+    val grossProfit: BigDecimal = BigDecimal.ZERO,
+    val grossLoss: BigDecimal = BigDecimal.ZERO,
     val totalFees: BigDecimal = BigDecimal.ZERO,
     val totalSlippage: BigDecimal = BigDecimal.ZERO,
     val signals: Int = 0,
@@ -70,6 +75,7 @@ data class ForwardSession(
     val stopPrice: BigDecimal? = null,
     val executionQuantities: Map<String, String>? = emptyMap(),
     val executionFees: Map<String, String>? = emptyMap(),
+    val executionPnls: Map<String, String>? = emptyMap(),
     val terminalExecutions: Set<String>? = emptySet(),
     val equityCurve: List<ForwardPoint> = emptyList(),
 )
@@ -116,7 +122,8 @@ internal fun forwardRuleFingerprint(rule: CryptoStrategyRule): String {
 data class ForwardPromotionDecision(val allowed: Boolean, val nextStage: ForwardStage?, val reasons: List<String>)
 data class ForwardMetrics(
     val pnl: BigDecimal, val returnPercent: BigDecimal, val uptimePercent: BigDecimal,
-    val errorRatePercent: BigDecimal, val fillRatePercent: BigDecimal,
+    val errorRatePercent: BigDecimal, val fillRatePercent: BigDecimal, val winRatePercent: BigDecimal,
+    val profitFactor: BigDecimal, val expectancy: BigDecimal,
 )
 data class ForwardTransition(val session: ForwardSession, val events: List<ForwardEvent> = emptyList())
 data class ForwardExecutionDelta(val quantity: BigDecimal, val fee: BigDecimal, val recordedFee: BigDecimal)
@@ -193,7 +200,16 @@ internal object ForwardEngine {
         val uptime = BigDecimal(elapsed - session.gapMillis.coerceAtMost(elapsed)).multiply(HUNDRED).divide(BigDecimal(elapsed), 4, RoundingMode.HALF_UP)
         val errorRate = if (session.orders == 0) BigDecimal.ZERO else BigDecimal(session.errors).multiply(HUNDRED).divide(BigDecimal(session.orders), 4, RoundingMode.HALF_UP)
         val fillRate = if (session.orders == 0) BigDecimal.ZERO else BigDecimal(session.fills).multiply(HUNDRED).divide(BigDecimal(session.orders), 4, RoundingMode.HALF_UP)
-        return ForwardMetrics(pnl, returns, uptime, errorRate, fillRate)
+        val winRate = if (session.closedTrades == 0) BigDecimal.ZERO else BigDecimal(session.winningTrades).multiply(HUNDRED)
+            .divide(BigDecimal(session.closedTrades), 4, RoundingMode.HALF_UP)
+        val profitFactor = when {
+            session.grossLoss.signum() > 0 -> session.grossProfit.divide(session.grossLoss, 8, RoundingMode.HALF_UP)
+            session.grossProfit.signum() > 0 -> BigDecimal("999")
+            else -> BigDecimal.ZERO
+        }
+        val expectancy = if (session.closedTrades == 0) BigDecimal.ZERO else session.realizedPnl
+            .divide(BigDecimal(session.closedTrades), 8, RoundingMode.HALF_UP)
+        return ForwardMetrics(pnl, returns, uptime, errorRate, fillRate, winRate, profitFactor, expectancy)
     }
 
     fun promotion(session: ForwardSession, gate: ForwardGateConfig): ForwardPromotionDecision {
@@ -226,6 +242,17 @@ internal object ForwardEngine {
             averageCost = if (remaining.signum() == 0) BigDecimal.ZERO else source.averageCost,
             realizedPnl = source.realizedPnl + pnl, totalFees = source.totalFees + fee)
         return markExternal(next, source.initialEquity + next.realizedPnl, now)
+    }
+
+    fun attributeExecutionPnl(source: ForwardSession, executionId: String, pnlDelta: BigDecimal): ForwardSession {
+        val values = source.executionPnls.orEmpty().toMutableMap()
+        val total = (values[executionId]?.toBigDecimalOrNull() ?: BigDecimal.ZERO) + pnlDelta
+        values[executionId] = total.toPlainString()
+        val pnls = values.values.mapNotNull(String::toBigDecimalOrNull)
+        return source.copy(executionPnls = values, closedTrades = pnls.size,
+            winningTrades = pnls.count { it.signum() > 0 }, losingTrades = pnls.count { it.signum() < 0 },
+            grossProfit = pnls.fold(BigDecimal.ZERO) { sum, value -> sum + value.max(BigDecimal.ZERO) },
+            grossLoss = pnls.fold(BigDecimal.ZERO) { sum, value -> sum + value.negate().max(BigDecimal.ZERO) })
     }
 
     fun attributeFee(source: ForwardSession, side: PaperOrderSide, fee: BigDecimal,
@@ -265,10 +292,10 @@ internal object ForwardEngine {
         }
         val gross = quantity * price; val fee = gross * feeRate; val pnl = gross - fee - source.averageCost * quantity
         val remaining = source.quantity - quantity
-        val next = source.copy(cash = source.cash + gross - fee, quantity = remaining,
+        val next = withTradeResult(source.copy(cash = source.cash + gross - fee, quantity = remaining,
             averageCost = if (remaining.signum() == 0) BigDecimal.ZERO else source.averageCost,
             realizedPnl = source.realizedPnl + pnl, fills = source.fills + 1, totalFees = source.totalFees + fee,
-            totalSlippage = source.totalSlippage + price.subtract(rawPrice).abs() * quantity)
+            totalSlippage = source.totalSlippage + price.subtract(rawPrice).abs() * quantity), pnl)
         events += event(next, now, ForwardEventType.EXIT, price, quantity, fee = fee, pnl = pnl, message = reason)
         return next
     }
@@ -277,6 +304,12 @@ internal object ForwardEngine {
         val equity = source.cash + source.quantity * price
         return markExternal(source, equity, now)
     }
+    private fun withTradeResult(source: ForwardSession, pnl: BigDecimal): ForwardSession = source.copy(
+        closedTrades = source.closedTrades + 1,
+        winningTrades = source.winningTrades + if (pnl.signum() > 0) 1 else 0,
+        losingTrades = source.losingTrades + if (pnl.signum() < 0) 1 else 0,
+        grossProfit = source.grossProfit + pnl.max(BigDecimal.ZERO),
+        grossLoss = source.grossLoss + pnl.negate().max(BigDecimal.ZERO))
     private fun appendPoint(points: List<ForwardPoint>, point: ForwardPoint): List<ForwardPoint> =
         (if (points.lastOrNull()?.time == point.time) points.dropLast(1) else points).plus(point).takeLast(500)
     private fun event(session: ForwardSession, time: Long, type: ForwardEventType, price: BigDecimal? = null,
@@ -340,7 +373,7 @@ object ForwardReportExporter {
         val rows = events.filter { it.sessionId == session.id }.sortedByDescending(ForwardEvent::time).joinToString("") {
             "<tr><td>${it.time}</td><td>${it.type}</td><td>${esc(redactForwardMessage(it.message))}</td><td>${it.price ?: "—"}</td><td>${it.pnl ?: "—"}</td></tr>"
         }
-        return """<!doctype html><html><head><meta charset="utf-8"><title>${esc(session.strategyName)} 前向验证</title><style>body{font:14px sans-serif;margin:28px;color:#222}.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.card{background:#f3f5f7;padding:12px;border-radius:6px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px}.audit{font-family:monospace;color:#555}</style></head><body><h1>${esc(session.strategyName)} · ${session.stage.label}</h1><p class="audit">Lineage ${esc(session.lineageId)} · Session ${esc(session.id)} · Snapshot ${esc(session.snapshotHash)}</p><div class="metrics"><div class="card">归因盈亏 ${metrics.pnl}</div><div class="card">收益 ${metrics.returnPercent}%</div><div class="card">回撤 ${session.maxDrawdownPercent}%</div><div class="card">在线率 ${metrics.uptimePercent}%</div><div class="card">手续费 ${session.totalFees}</div><div class="card">滑点成本 ${session.totalSlippage}</div></div><h2>资金曲线</h2><svg viewBox="0 0 900 240" width="100%"><polyline fill="none" stroke="#3978b8" stroke-width="2" points="$points"/></svg><h2>事件</h2><table><tr><th>时间</th><th>类型</th><th>说明</th><th>价格</th><th>盈亏</th></tr>$rows</table><p>报告不包含 API Key、Secret 或账户凭据。</p></body></html>"""
+        return """<!doctype html><html><head><meta charset="utf-8"><title>${esc(session.strategyName)} 前向验证</title><style>body{font:14px sans-serif;margin:28px;color:#222}.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.card{background:#f3f5f7;padding:12px;border-radius:6px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px}.audit{font-family:monospace;color:#555}</style></head><body><h1>${esc(session.strategyName)} · ${session.stage.label}</h1><p class="audit">Lineage ${esc(session.lineageId)} · Session ${esc(session.id)} · Snapshot ${esc(session.snapshotHash)}</p><div class="metrics"><div class="card">归因盈亏 ${metrics.pnl}</div><div class="card">收益 ${metrics.returnPercent}%</div><div class="card">回撤 ${session.maxDrawdownPercent}%</div><div class="card">在线率 ${metrics.uptimePercent}%</div><div class="card">胜率 ${metrics.winRatePercent}%</div><div class="card">Profit Factor ${metrics.profitFactor}</div><div class="card">单笔期望 ${metrics.expectancy}</div><div class="card">手续费 ${session.totalFees}</div><div class="card">滑点成本 ${session.totalSlippage}</div></div><h2>资金曲线</h2><svg viewBox="0 0 900 240" width="100%"><polyline fill="none" stroke="#3978b8" stroke-width="2" points="$points"/></svg><h2>事件</h2><table><tr><th>时间</th><th>类型</th><th>说明</th><th>价格</th><th>盈亏</th></tr>$rows</table><p>报告不包含 API Key、Secret 或账户凭据。</p></body></html>"""
     }
 }
 
@@ -368,6 +401,7 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
             session.copy(healthPauseReason = runCatching { session.healthPauseReason }.getOrNull().orEmpty(),
                 executionQuantities = session.executionQuantities.orEmpty(), terminalExecutions = session.terminalExecutions.orEmpty(),
                 executionFees = session.executionFees.orEmpty(),
+                executionPnls = session.executionPnls.orEmpty(),
                 lineageId = runCatching { session.lineageId }.getOrNull().orEmpty().ifBlank { session.id },
                 snapshotHash = runCatching { session.snapshotHash }.getOrNull().orEmpty().ifBlank { forwardRuleFingerprint(session.ruleSnapshot) })
         }.toMutableList()
@@ -520,6 +554,8 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
         if (filled && side != null && price != null && quantity != null) {
             next = ForwardEngine.attributeFill(next, side, price, quantity, fee).copy(
                 executionQuantities = next.executionQuantities.orEmpty() + (executionId to quantity.toPlainString()))
+            if (side == PaperOrderSide.SELL) next = ForwardEngine.attributeExecutionPnl(next, executionId,
+                next.realizedPnl - source.realizedPnl)
         }
         if (!success) next = next.copy(terminalExecutions = next.terminalExecutions.orEmpty() + executionId)
         if (!success) forwardHealthReason(healthPolicy, consecutiveErrors = next.consecutiveErrors)?.let { reason ->
@@ -527,21 +563,15 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
             record(event(next, ForwardEventType.HEALTH_PAUSE, reason, executionId, price, quantity))
             CryptoNotifications.warn("前向验证已自动暂停：${next.strategyName}", reason)
         }
-        replace(next); record(event(next, if (!success) ForwardEventType.ERROR else if (filled) ForwardEventType.FILL else ForwardEventType.ORDER,
-            message, executionId, price, quantity, latencyMillis)); encode()
+        val pnl = (next.realizedPnl - source.realizedPnl).takeIf { filled && side == PaperOrderSide.SELL }
+        replace(next); record(event(next, if (!success) ForwardEventType.ERROR else if (filled && side == PaperOrderSide.SELL) ForwardEventType.EXIT
+            else if (filled) ForwardEventType.FILL else ForwardEventType.ORDER,
+            message, executionId, price, quantity, latencyMillis, pnl)); encode()
     }
     @Synchronized fun recordBlocked(strategyId: String, executionId: String, message: String, price: BigDecimal? = null) {
         val source = sessionFor(strategyId) ?: return
         val next = source.copy(blocked = source.blocked + 1)
         replace(next); record(event(next, ForwardEventType.BLOCKED, message, executionId, price)); encode()
-    }
-    @Synchronized fun recordOutcome(symbol: String, stage: ForwardStage, pnl: BigDecimal) {
-        sessions.filter { it.symbol == symbol && it.stage == stage && it.status == ForwardSessionStatus.RUNNING }.forEach { source ->
-            val realized = source.realizedPnl + pnl
-            replace(ForwardEngine.markExternal(source.copy(realizedPnl = realized), source.initialEquity + realized, System.currentTimeMillis()))
-            record(event(source, ForwardEventType.EXIT, "已实现盈亏", pnl = pnl))
-        }
-        encode()
     }
     @Synchronized fun recordExecutionUpdate(strategyId: String, executionId: String, status: String, side: PaperOrderSide,
                                             price: BigDecimal?, executedQuantity: BigDecimal, fee: BigDecimal = BigDecimal.ZERO,
@@ -559,11 +589,16 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
                 executionQuantities = next.executionQuantities.orEmpty() + (executionId to executedQuantity.toPlainString()),
                 executionFees = next.executionFees.orEmpty() + (executionId to recordedFee.toPlainString()))
             if (price != null) next = ForwardEngine.attributeFill(next, side, price, delta, feeDelta)
-            replace(next); record(event(next, ForwardEventType.FILL, "$sourceLabel 成交：$status", executionId, price, delta, fee = feeDelta))
+            val pnl = (next.realizedPnl - source.realizedPnl).takeIf { side == PaperOrderSide.SELL }
+            if (side == PaperOrderSide.SELL) next = ForwardEngine.attributeExecutionPnl(next, executionId, pnl ?: BigDecimal.ZERO)
+            replace(next); record(event(next, if (side == PaperOrderSide.SELL) ForwardEventType.EXIT else ForwardEventType.FILL,
+                "$sourceLabel 成交：$status", executionId, price, delta, pnl = pnl, fee = feeDelta))
         } else if (feeDelta.signum() > 0) {
             next = ForwardEngine.attributeFee(next, side, feeDelta).copy(
                 executionFees = next.executionFees.orEmpty() + (executionId to recordedFee.toPlainString()))
-            replace(next); record(event(next, ForwardEventType.FILL, "$sourceLabel 手续费补记", executionId, price, fee = feeDelta))
+            if (side == PaperOrderSide.SELL) next = ForwardEngine.attributeExecutionPnl(next, executionId, feeDelta.negate())
+            replace(next); record(event(next, if (side == PaperOrderSide.SELL) ForwardEventType.EXIT else ForwardEventType.FILL,
+                "$sourceLabel 手续费补记", executionId, price, pnl = feeDelta.negate().takeIf { side == PaperOrderSide.SELL }, fee = feeDelta))
         }
         if (status == "REJECTED" && executionId !in next.terminalExecutions.orEmpty()) {
             next = next.copy(errors = next.errors + 1, consecutiveErrors = next.consecutiveErrors + 1,

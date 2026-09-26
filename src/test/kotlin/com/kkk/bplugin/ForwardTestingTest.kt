@@ -20,6 +20,9 @@ class ForwardTestingTest : TestCase() {
         assertEquals(0, exit.session.quantity.compareTo(BigDecimal.ZERO))
         assertEquals(2, exit.session.fills)
         assertTrue(exit.session.realizedPnl.signum() > 0)
+        assertEquals(1, exit.session.closedTrades)
+        assertEquals(1, exit.session.winningTrades)
+        assertTrue(ForwardEngine.metrics(exit.session).profitFactor > BigDecimal.ONE)
         assertTrue(exit.events.any { it.type == ForwardEventType.EXIT })
     }
 
@@ -97,6 +100,17 @@ class ForwardTestingTest : TestCase() {
         assertEquals(0, delta.quantity.compareTo(BigDecimal.ONE))
         assertEquals(0, delta.fee.compareTo(BigDecimal.ZERO))
         assertEquals(0, delta.recordedFee.compareTo(BigDecimal("0.1")))
+    }
+
+    fun testLateSellFeeAdjustsExistingExecutionStatistics() {
+        val initial = session(rule()).copy(quantity = BigDecimal.ONE, averageCost = BigDecimal("100"))
+        val sold = ForwardEngine.attributeFill(initial, PaperOrderSide.SELL, BigDecimal("110"), BigDecimal.ONE)
+        val tracked = ForwardEngine.attributeExecutionPnl(sold, "exec", sold.realizedPnl - initial.realizedPnl)
+        val charged = ForwardEngine.attributeFee(tracked, PaperOrderSide.SELL, BigDecimal.ONE)
+        val reconciled = ForwardEngine.attributeExecutionPnl(charged, "exec", BigDecimal.ONE.negate())
+        assertEquals(1, reconciled.closedTrades)
+        assertEquals(0, reconciled.grossProfit.compareTo(BigDecimal("9")))
+        assertEquals(0, ForwardEngine.metrics(reconciled).expectancy.compareTo(BigDecimal("9")))
     }
 
     fun testExportContainsMetricsButNoCredentialFields() {
