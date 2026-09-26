@@ -73,6 +73,8 @@ class ForwardTestingTest : TestCase() {
         assertTrue(forwardHealthReason(policy, singleGapMillis = 60_000)!!.contains("行情断档"))
         assertTrue(forwardHealthReason(policy, consecutiveErrors = 3)!!.contains("订单错误"))
         assertTrue(forwardHealthReason(policy.copy(maxOrderLatencyMillis = 2_000), orderLatencyMillis = 2_000)!!.contains("响应耗时"))
+        assertTrue(forwardHealthReason(policy.copy(maxOrdersPerSession = 5), orderCount = 5)!!.contains("订单数"))
+        assertTrue(forwardHealthReason(policy.copy(maxSessionDurationMillis = 86_400_000), sessionRuntimeMillis = 86_400_000)!!.contains("运行已达"))
         assertNull(forwardHealthReason(policy.copy(autoPause = false), singleGapMillis = 600_000, consecutiveErrors = 10))
     }
 

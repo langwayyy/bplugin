@@ -202,17 +202,24 @@ class ForwardTestingPanel(private val project: Project?, private val ruleProvide
         val gapSeconds = JTextField((current.maxSingleGapMillis / 1000).toString(), 8)
         val errors = JTextField(current.maxConsecutiveErrors.toString(), 8)
         val latency = JTextField((current.maxOrderLatencyMillis ?: 10_000).toString(), 8)
+        val maxOrders = JTextField((current.maxOrdersPerSession ?: 100).toString(), 8)
+        val maxDays = JTextField(((current.maxSessionDurationMillis ?: 30L * 86_400_000) / 86_400_000).toString(), 8)
         val panel = JPanel(java.awt.GridLayout(0, 2, 8, 6)).apply {
             add(enabled); add(JLabel("")); add(JLabel("单次行情断档阈值（秒）")); add(gapSeconds)
             add(JLabel("连续订单错误阈值")); add(errors)
             add(JLabel("单次订单延迟阈值（毫秒）")); add(latency)
+            add(JLabel("单会话订单数上限")); add(maxOrders)
+            add(JLabel("单会话运行上限（天）")); add(maxDays)
         }
         if (JOptionPane.showConfirmDialog(this, panel, "前向验证健康策略", JOptionPane.OK_CANCEL_OPTION,
                 JOptionPane.PLAIN_MESSAGE) != JOptionPane.OK_OPTION) return
         val seconds = gapSeconds.text.toLongOrNull() ?: return message("断档阈值格式无效")
         val count = errors.text.toIntOrNull() ?: return message("错误阈值格式无效")
         val latencyMillis = latency.text.toLongOrNull() ?: return message("延迟阈值格式无效")
-        service.setHealthPolicy(ForwardHealthPolicy(enabled.isSelected, seconds * 1000, count, latencyMillis)); refresh(true)
+        val orderLimit = maxOrders.text.toIntOrNull() ?: return message("订单数上限格式无效")
+        val days = maxDays.text.toLongOrNull() ?: return message("运行天数上限格式无效")
+        service.setHealthPolicy(ForwardHealthPolicy(enabled.isSelected, seconds.coerceIn(30, 86_400) * 1000, count, latencyMillis,
+            orderLimit, days.coerceIn(1, 365) * 86_400_000)); refresh(true)
     }
     private fun export(format: String) {
         val item = selectedSession() ?: return message("请选择会话")

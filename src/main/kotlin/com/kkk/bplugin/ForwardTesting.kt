@@ -106,13 +106,25 @@ data class ForwardHealthPolicy(
     val maxSingleGapMillis: Long = 600_000,
     val maxConsecutiveErrors: Int = 3,
     val maxOrderLatencyMillis: Long? = 10_000,
+    val maxOrdersPerSession: Int? = 100,
+    val maxSessionDurationMillis: Long? = 30L * 24 * 60 * 60 * 1000,
 )
+internal fun normalizeForwardHealthPolicy(value: ForwardHealthPolicy) = value.copy(
+    maxSingleGapMillis = value.maxSingleGapMillis.coerceIn(30_000, 86_400_000),
+    maxConsecutiveErrors = value.maxConsecutiveErrors.coerceIn(1, 100),
+    maxOrderLatencyMillis = (value.maxOrderLatencyMillis ?: 10_000).coerceIn(500, 300_000),
+    maxOrdersPerSession = (value.maxOrdersPerSession ?: 100).coerceIn(1, 100_000),
+    maxSessionDurationMillis = (value.maxSessionDurationMillis ?: 30L * 86_400_000).coerceIn(3_600_000, 365L * 86_400_000))
 internal fun forwardHealthReason(policy: ForwardHealthPolicy, singleGapMillis: Long = 0,
-                                 consecutiveErrors: Int = 0, orderLatencyMillis: Long = 0): String? = when {
+                                 consecutiveErrors: Int = 0, orderLatencyMillis: Long = 0,
+                                 orderCount: Int = 0, sessionRuntimeMillis: Long = 0): String? = when {
     !policy.autoPause -> null
     singleGapMillis >= policy.maxSingleGapMillis -> "单次行情断档 ${singleGapMillis / 1000} 秒，达到自动暂停阈值"
     consecutiveErrors >= policy.maxConsecutiveErrors -> "连续订单错误 $consecutiveErrors 次，已自动暂停"
     orderLatencyMillis >= (policy.maxOrderLatencyMillis ?: 10_000) -> "订单响应耗时 $orderLatencyMillis 毫秒，达到自动暂停阈值"
+    orderCount >= (policy.maxOrdersPerSession ?: 100) -> "会话订单数 $orderCount，达到自动暂停上限"
+    sessionRuntimeMillis >= (policy.maxSessionDurationMillis ?: 30L * 24 * 60 * 60 * 1000) ->
+        "会话运行已达 ${sessionRuntimeMillis / 86_400_000} 天，达到自动暂停上限"
     else -> null
 }
 internal fun forwardStaleMillis(session: ForwardSession, now: Long): Long {
@@ -456,7 +468,8 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
         events = decodeList<ForwardEvent>(state.eventsJson).take(1000).toMutableList()
         pendingJournal = decodeList<ForwardEvent>(state.pendingJournalJson).take(500).toMutableList()
         gate = runCatching { gson.fromJson(state.gateJson, ForwardGateConfig::class.java) }.getOrNull() ?: ForwardGateConfig()
-        healthPolicy = runCatching { gson.fromJson(state.healthPolicyJson, ForwardHealthPolicy::class.java) }.getOrNull() ?: ForwardHealthPolicy()
+        healthPolicy = normalizeForwardHealthPolicy(runCatching { gson.fromJson(state.healthPolicyJson, ForwardHealthPolicy::class.java) }
+            .getOrNull() ?: ForwardHealthPolicy())
         val interrupted = sessions.filter { it.status == ForwardSessionStatus.RUNNING }
         interrupted.forEach { source ->
             val next = source.copy(status = ForwardSessionStatus.RECOVERY_REQUIRED, lastMarketAt = 0,
@@ -484,9 +497,7 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
     @Synchronized fun gate() = gate
     @Synchronized fun healthPolicy() = healthPolicy
     @Synchronized fun setHealthPolicy(value: ForwardHealthPolicy) {
-        healthPolicy = value.copy(maxSingleGapMillis = value.maxSingleGapMillis.coerceIn(30_000, 86_400_000),
-            maxConsecutiveErrors = value.maxConsecutiveErrors.coerceIn(1, 100),
-            maxOrderLatencyMillis = (value.maxOrderLatencyMillis ?: 10_000).coerceIn(500, 300_000)); encode()
+        healthPolicy = normalizeForwardHealthPolicy(value); encode()
     }
     @Synchronized fun setGate(value: ForwardGateConfig) {
         gate = value.copy(minSignals = value.minSignals.coerceIn(1, 10_000),
@@ -577,7 +588,8 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
         var changed = false
         sessions.filter { it.status == ForwardSessionStatus.RUNNING }.toList().forEach { source ->
             val stale = forwardStaleMillis(source, now)
-            forwardHealthReason(healthPolicy, singleGapMillis = stale)?.let { reason ->
+            forwardHealthReason(healthPolicy, singleGapMillis = stale, orderCount = source.orders,
+                sessionRuntimeMillis = (now - source.startedAt).coerceAtLeast(0))?.let { reason ->
                 val next = source.copy(status = ForwardSessionStatus.PAUSED, healthPauseReason = reason,
                     gapMillis = source.gapMillis + stale, lastMarketAt = 0)
                 replace(next); record(event(next, ForwardEventType.HEALTH_PAUSE, "$reason（健康巡检）"))
@@ -620,12 +632,9 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
                 next.realizedPnl - source.realizedPnl)
         }
         if (!success) next = next.copy(terminalExecutions = next.terminalExecutions.orEmpty() + executionId)
-        if (!success) forwardHealthReason(healthPolicy, consecutiveErrors = next.consecutiveErrors)?.let { reason ->
-            next = next.copy(status = ForwardSessionStatus.PAUSED, healthPauseReason = reason, lastMarketAt = 0)
-            record(event(next, ForwardEventType.HEALTH_PAUSE, reason, executionId, price, quantity))
-            CryptoNotifications.warn("前向验证已自动暂停：${next.strategyName}", reason)
-        }
-        if (success && observedLatency != null) forwardHealthReason(healthPolicy, orderLatencyMillis = observedLatency)?.let { reason ->
+        forwardHealthReason(healthPolicy, consecutiveErrors = if (success) 0 else next.consecutiveErrors,
+            orderLatencyMillis = observedLatency ?: 0, orderCount = next.orders,
+            sessionRuntimeMillis = (System.currentTimeMillis() - next.startedAt).coerceAtLeast(0))?.let { reason ->
             next = next.copy(status = ForwardSessionStatus.PAUSED, healthPauseReason = reason, lastMarketAt = 0)
             record(event(next, ForwardEventType.HEALTH_PAUSE, reason, executionId, price, quantity, observedLatency))
             CryptoNotifications.warn("前向验证已自动暂停：${next.strategyName}", reason)
