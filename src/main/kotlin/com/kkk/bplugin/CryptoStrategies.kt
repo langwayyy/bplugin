@@ -525,6 +525,14 @@ class CryptoStrategyService : PersistentStateComponent<CryptoStrategyService.Sto
         ForwardTestService.getInstance().recordExecutionUpdate(execution.strategyId, execution.id, order.status, order.side,
             order.averagePrice ?: order.price.takeIf { it.signum() > 0 }, order.executedQuantity)
     }
+    @Synchronized fun recordPaperOrderUpdate(order: PaperOrder) {
+        if (order.status != PaperOrderStatus.FILLED || order.fillPrice == null) return
+        val execution = executions.firstOrNull {
+            it.orderId == order.id || (!order.ocoGroupId.isNullOrBlank() && it.orderId == order.ocoGroupId)
+        } ?: return
+        ForwardTestService.getInstance().recordExecutionUpdate(execution.strategyId, execution.id, "FILLED", order.side,
+            order.fillPrice, order.quantity, order.fee, "模拟盘")
+    }
     @Synchronized fun recordPaperOutcome(pnl: BigDecimal) {
         if (pnl.signum() == 0) return
         portfolioRuntime = portfolioRuntime.copy(consecutiveLosses = if (pnl.signum() < 0) portfolioRuntime.consecutiveLosses + 1 else 0)

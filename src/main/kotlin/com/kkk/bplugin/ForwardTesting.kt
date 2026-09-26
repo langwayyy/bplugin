@@ -24,8 +24,8 @@ enum class ForwardStage(val label: String) {
     override fun toString() = label
     fun next(): ForwardStage? = entries.getOrNull(ordinal + 1)
 }
-enum class ForwardSessionStatus(val label: String) { RUNNING("运行中"), PAUSED("已暂停"), COMPLETED("已结束") }
-enum class ForwardEventType { SESSION_START, SESSION_PAUSE, SESSION_RESUME, SESSION_END, MARKET_GAP, SIGNAL, BLOCKED, ORDER, FILL, EXIT, ERROR, PROMOTION }
+enum class ForwardSessionStatus(val label: String) { RUNNING("运行中"), PAUSED("已暂停"), RECOVERY_REQUIRED("待恢复"), COMPLETED("已结束") }
+enum class ForwardEventType { SESSION_START, SESSION_PAUSE, SESSION_RESUME, SESSION_END, RECOVERY, HEALTH_PAUSE, MARKET_GAP, SIGNAL, BLOCKED, ORDER, FILL, EXIT, ERROR, PROMOTION }
 
 data class ForwardPoint(val time: Long, val equity: BigDecimal)
 data class ForwardSession(
@@ -54,6 +54,8 @@ data class ForwardSession(
     val fills: Int = 0,
     val blocked: Int = 0,
     val errors: Int = 0,
+    val consecutiveErrors: Int = 0,
+    val healthPauseReason: String = "",
     val lastMarketAt: Long = 0,
     val gapMillis: Long = 0,
     val pendingSide: PaperOrderSide? = null,
@@ -62,6 +64,7 @@ data class ForwardSession(
     val targetPrice: BigDecimal? = null,
     val stopPrice: BigDecimal? = null,
     val executionQuantities: Map<String, String>? = emptyMap(),
+    val terminalExecutions: Set<String>? = emptySet(),
     val equityCurve: List<ForwardPoint> = emptyList(),
 )
 
@@ -79,6 +82,18 @@ data class ForwardGateConfig(
     val maxErrorRatePercent: BigDecimal = BigDecimal("10"),
     val minUptimePercent: BigDecimal = BigDecimal("95"),
 )
+data class ForwardHealthPolicy(
+    val autoPause: Boolean = true,
+    val maxSingleGapMillis: Long = 600_000,
+    val maxConsecutiveErrors: Int = 3,
+)
+internal fun forwardHealthReason(policy: ForwardHealthPolicy, singleGapMillis: Long = 0,
+                                 consecutiveErrors: Int = 0): String? = when {
+    !policy.autoPause -> null
+    singleGapMillis >= policy.maxSingleGapMillis -> "单次行情断档 ${singleGapMillis / 1000} 秒，达到自动暂停阈值"
+    consecutiveErrors >= policy.maxConsecutiveErrors -> "连续订单错误 $consecutiveErrors 次，已自动暂停"
+    else -> null
+}
 data class ForwardPromotionDecision(val allowed: Boolean, val nextStage: ForwardStage?, val reasons: List<String>)
 data class ForwardMetrics(
     val pnl: BigDecimal, val returnPercent: BigDecimal, val uptimePercent: BigDecimal,
@@ -249,6 +264,22 @@ internal class ForwardEventJournal(private val root: Path, private val retention
             if (date != null && date.isBefore(today.minusDays(retentionDays))) Files.deleteIfExists(path)
         } }
     }
+    @Synchronized fun read(from: LocalDate, to: LocalDate, sessionId: String? = null,
+                           types: Set<ForwardEventType> = emptySet(), limit: Int = 5_000): List<ForwardEvent> {
+        if (!Files.exists(root) || to.isBefore(from) || limit <= 0) return emptyList()
+        val result = mutableListOf<ForwardEvent>()
+        var date = to
+        while (!date.isBefore(from) && result.size < limit) {
+            val path = root.resolve("$date.jsonl")
+            if (Files.isRegularFile(path)) Files.readAllLines(path, StandardCharsets.UTF_8).asReversed().forEach { line ->
+                if (result.size >= limit) return@forEach
+                val event = runCatching { gson.fromJson(line, ForwardEvent::class.java) }.getOrNull() ?: return@forEach
+                if ((sessionId == null || event.sessionId == sessionId) && (types.isEmpty() || event.type in types)) result += event
+            }
+            date = date.minusDays(1)
+        }
+        return result
+    }
 }
 
 object ForwardReportExporter {
@@ -277,12 +308,14 @@ object ForwardReportExporter {
 @Service(Service.Level.APP)
 @State(name = "QuietCryptoForwardTesting", storages = [Storage("quiet-crypto-forward.xml")])
 class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredState> {
-    data class StoredState(var sessionsJson: String = "[]", var eventsJson: String = "[]", var gateJson: String = "")
+    data class StoredState(var sessionsJson: String = "[]", var eventsJson: String = "[]", var gateJson: String = "",
+                           var healthPolicyJson: String = "")
     private val gson = Gson()
     private var stored = StoredState()
     private var sessions = mutableListOf<ForwardSession>()
     private var events = mutableListOf<ForwardEvent>()
     private var gate = ForwardGateConfig()
+    private var healthPolicy = ForwardHealthPolicy()
     private var lastEncodedAt = 0L
     private val journal by lazy { ForwardEventJournal(Path.of(PathManager.getSystemPath(), "quiet-crypto", "forward-events")) }
 
@@ -290,19 +323,41 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
     @Synchronized override fun getState(): StoredState = stored.apply { encode() }
     @Synchronized override fun loadState(state: StoredState) {
         stored = state
-        sessions = decodeList<ForwardSession>(state.sessionsJson).take(100).toMutableList()
+        sessions = decodeList<ForwardSession>(state.sessionsJson).take(100).map { session ->
+            session.copy(healthPauseReason = runCatching { session.healthPauseReason }.getOrNull().orEmpty(),
+                executionQuantities = session.executionQuantities.orEmpty(), terminalExecutions = session.terminalExecutions.orEmpty())
+        }.toMutableList()
         events = decodeList<ForwardEvent>(state.eventsJson).take(1000).toMutableList()
         gate = runCatching { gson.fromJson(state.gateJson, ForwardGateConfig::class.java) }.getOrNull() ?: ForwardGateConfig()
+        healthPolicy = runCatching { gson.fromJson(state.healthPolicyJson, ForwardHealthPolicy::class.java) }.getOrNull() ?: ForwardHealthPolicy()
+        val interrupted = sessions.filter { it.status == ForwardSessionStatus.RUNNING }
+        interrupted.forEach { source ->
+            val next = source.copy(status = ForwardSessionStatus.RECOVERY_REQUIRED, lastMarketAt = 0,
+                healthPauseReason = "插件重启后需人工确认恢复")
+            replace(next); record(event(next, ForwardEventType.RECOVERY, next.healthPauseReason))
+        }
+        if (interrupted.isNotEmpty()) encode()
     }
     @Synchronized fun sessions() = sessions.toList()
     @Synchronized fun events() = events.toList()
+    @Synchronized fun historicalEvents(sessionId: String? = null, days: Long = 30, limit: Int = 5_000): List<ForwardEvent> {
+        val today = LocalDate.now()
+        return journal.read(today.minusDays(days.coerceIn(1, 30) - 1), today, sessionId, limit = limit.coerceIn(1, 20_000))
+    }
     @Synchronized fun trackedSymbols() = sessions.filter { it.status != ForwardSessionStatus.COMPLETED }.map(ForwardSession::symbol).distinct()
     @Synchronized fun diagnostics(): String {
         val active = sessions.count { it.status != ForwardSessionStatus.COMPLETED }
         val gaps = sessions.sumOf(ForwardSession::gapMillis)
-        return "前向验证: $active 个活动会话 / ${sessions.size} 个会话, ${events.size} 条近期事件, 累计数据缺口 ${gaps / 1000} 秒\n"
+        val recovery = sessions.count { it.status == ForwardSessionStatus.RECOVERY_REQUIRED }
+        val unhealthy = sessions.count { it.healthPauseReason.isNotBlank() }
+        return "前向验证: $active 个活动会话 / ${sessions.size} 个会话, ${events.size} 条近期事件, 待恢复 $recovery, 健康暂停 $unhealthy, 累计数据缺口 ${gaps / 1000} 秒\n"
     }
     @Synchronized fun gate() = gate
+    @Synchronized fun healthPolicy() = healthPolicy
+    @Synchronized fun setHealthPolicy(value: ForwardHealthPolicy) {
+        healthPolicy = value.copy(maxSingleGapMillis = value.maxSingleGapMillis.coerceIn(30_000, 86_400_000),
+            maxConsecutiveErrors = value.maxConsecutiveErrors.coerceIn(1, 100)); encode()
+    }
     @Synchronized fun setGate(value: ForwardGateConfig) {
         gate = value.copy(minSignals = value.minSignals.coerceIn(1, 10_000),
             maxDrawdownPercent = value.maxDrawdownPercent.coerceIn(BigDecimal("0.1"), BigDecimal("100")),
@@ -349,7 +404,15 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
         sessions.filter { source -> source.status == ForwardSessionStatus.RUNNING && source.symbol == quote.symbol &&
             (((source.ruleSnapshot.triggerMode ?: StrategyTriggerMode.INTRABAR) == StrategyTriggerMode.CLOSE) == closedCandle) }.toList().forEach { source ->
             val transition = ForwardEngine.market(source, safeQuote, settings().paperFeeBps, settings().paperSlippageBps)
-            replace(transition.session); transition.events.forEach(::record)
+            var next = transition.session
+            transition.events.forEach(::record)
+            val newGap = next.gapMillis - source.gapMillis
+            forwardHealthReason(healthPolicy, singleGapMillis = newGap)?.let { reason ->
+                next = next.copy(status = ForwardSessionStatus.PAUSED, healthPauseReason = reason, lastMarketAt = 0)
+                record(event(next, ForwardEventType.HEALTH_PAUSE, reason))
+                CryptoNotifications.warn("前向验证已自动暂停：${next.strategyName}", reason)
+            }
+            replace(next)
         }
         encode(false)
     }
@@ -373,8 +436,18 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
                                   side: PaperOrderSide? = null, fee: BigDecimal = BigDecimal.ZERO) {
         val source = sessionFor(strategyId) ?: return
         var next = source.copy(orders = source.orders + 1, fills = source.fills + if (filled) 1 else 0,
-            errors = source.errors + if (success) 0 else 1)
-        if (filled && side != null && price != null && quantity != null) next = ForwardEngine.attributeFill(next, side, price, quantity, fee)
+            errors = source.errors + if (success) 0 else 1,
+            consecutiveErrors = if (success) 0 else source.consecutiveErrors + 1)
+        if (filled && side != null && price != null && quantity != null) {
+            next = ForwardEngine.attributeFill(next, side, price, quantity, fee).copy(
+                executionQuantities = next.executionQuantities.orEmpty() + (executionId to quantity.toPlainString()))
+        }
+        if (!success) next = next.copy(terminalExecutions = next.terminalExecutions.orEmpty() + executionId)
+        if (!success) forwardHealthReason(healthPolicy, consecutiveErrors = next.consecutiveErrors)?.let { reason ->
+            next = next.copy(status = ForwardSessionStatus.PAUSED, healthPauseReason = reason, lastMarketAt = 0)
+            record(event(next, ForwardEventType.HEALTH_PAUSE, reason, executionId, price, quantity))
+            CryptoNotifications.warn("前向验证已自动暂停：${next.strategyName}", reason)
+        }
         replace(next); record(event(next, if (!success) ForwardEventType.ERROR else if (filled) ForwardEventType.FILL else ForwardEventType.ORDER,
             message, executionId, price, quantity, latencyMillis)); encode()
     }
@@ -392,7 +465,8 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
         encode()
     }
     @Synchronized fun recordExecutionUpdate(strategyId: String, executionId: String, status: String, side: PaperOrderSide,
-                                            price: BigDecimal?, executedQuantity: BigDecimal) {
+                                            price: BigDecimal?, executedQuantity: BigDecimal, fee: BigDecimal = BigDecimal.ZERO,
+                                            sourceLabel: String = "测试网") {
         val source = sessionFor(strategyId) ?: return
         val previous = source.executionQuantities.orEmpty()[executionId]?.toBigDecimalOrNull() ?: BigDecimal.ZERO
         val delta = (executedQuantity - previous).max(BigDecimal.ZERO)
@@ -400,12 +474,18 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
         if (delta.signum() > 0) {
             next = next.copy(fills = next.fills + if (previous.signum() == 0) 1 else 0,
                 executionQuantities = next.executionQuantities.orEmpty() + (executionId to executedQuantity.toPlainString()))
-            if (price != null) next = ForwardEngine.attributeFill(next, side, price, delta)
-            replace(next); record(event(next, ForwardEventType.FILL, "测试网成交：$status", executionId, price, delta))
+            if (price != null) next = ForwardEngine.attributeFill(next, side, price, delta, fee)
+            replace(next); record(event(next, ForwardEventType.FILL, "$sourceLabel 成交：$status", executionId, price, delta, fee = fee))
         }
-        if (status == "REJECTED") {
-            next = next.copy(errors = next.errors + 1); replace(next)
-            record(event(next, ForwardEventType.ERROR, "测试网订单被拒绝", executionId, price))
+        if (status == "REJECTED" && executionId !in next.terminalExecutions.orEmpty()) {
+            next = next.copy(errors = next.errors + 1, consecutiveErrors = next.consecutiveErrors + 1,
+                terminalExecutions = next.terminalExecutions.orEmpty() + executionId)
+            forwardHealthReason(healthPolicy, consecutiveErrors = next.consecutiveErrors)?.let { reason ->
+                next = next.copy(status = ForwardSessionStatus.PAUSED, healthPauseReason = reason, lastMarketAt = 0)
+                record(event(next, ForwardEventType.HEALTH_PAUSE, reason, executionId, price))
+                CryptoNotifications.warn("前向验证已自动暂停：${next.strategyName}", reason)
+            }
+            replace(next); record(event(next, ForwardEventType.ERROR, "$sourceLabel 订单被拒绝", executionId, price))
         }
         encode()
     }
@@ -413,7 +493,9 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
 
     private fun changeStatus(id: String, status: ForwardSessionStatus, type: ForwardEventType, message: String): Boolean {
         val source = sessions.firstOrNull { it.id == id && it.status != ForwardSessionStatus.COMPLETED } ?: return false
-        replace(source.copy(status = status, lastMarketAt = if (status == ForwardSessionStatus.RUNNING) 0 else source.lastMarketAt))
+        replace(source.copy(status = status, lastMarketAt = if (status == ForwardSessionStatus.RUNNING) 0 else source.lastMarketAt,
+            healthPauseReason = if (status == ForwardSessionStatus.RUNNING) "" else source.healthPauseReason,
+            consecutiveErrors = if (status == ForwardSessionStatus.RUNNING) 0 else source.consecutiveErrors))
         record(event(source, type, message)); encode(); return true
     }
     private fun replace(value: ForwardSession) { sessions = sessions.map { if (it.id == value.id) value else it }.toMutableList() }
@@ -423,9 +505,9 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
     }
     private fun event(session: ForwardSession, type: ForwardEventType, message: String, executionId: String = "",
                       price: BigDecimal? = null, quantity: BigDecimal? = null, latencyMillis: Long? = null,
-                      pnl: BigDecimal? = null) = ForwardEvent(sessionId = session.id, time = System.currentTimeMillis(), type = type,
+                      pnl: BigDecimal? = null, fee: BigDecimal? = null) = ForwardEvent(sessionId = session.id, time = System.currentTimeMillis(), type = type,
         stage = session.stage, strategyId = session.strategyId, strategyName = session.strategyName, symbol = session.symbol,
-        executionId = executionId, price = price, quantity = quantity, latencyMillis = latencyMillis, pnl = pnl, message = message.take(240))
+        executionId = executionId, price = price, quantity = quantity, latencyMillis = latencyMillis, pnl = pnl, fee = fee, message = message.take(240))
     private fun environmentEquity(stage: ForwardStage): BigDecimal = when (stage) {
         ForwardStage.SHADOW -> BigDecimal("10000")
         ForwardStage.PAPER -> CryptoPaperTradingService.getInstance().summary(CryptoMarketService.getInstance().quotes.mapValues { it.value.price }).equity
@@ -442,6 +524,7 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
         val now = System.currentTimeMillis()
         if (!force && now - lastEncodedAt < 5_000) return
         stored.sessionsJson = gson.toJson(sessions.take(100)); stored.eventsJson = gson.toJson(events.take(1000)); stored.gateJson = gson.toJson(gate)
+        stored.healthPolicyJson = gson.toJson(healthPolicy)
         lastEncodedAt = now
     }
     private inline fun <reified T> decodeList(json: String): List<T> = runCatching {

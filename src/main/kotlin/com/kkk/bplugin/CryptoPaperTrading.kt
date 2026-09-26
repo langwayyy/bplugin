@@ -276,16 +276,24 @@ class CryptoPaperTradingService : PersistentStateComponent<CryptoPaperTradingSer
     @Synchronized fun cancel(id: String): Boolean = book.cancel(id).also { if (it) save() }
     @Synchronized fun onQuote(quote: CryptoQuote) {
         val before = book.account.realizedPnl
+        val openIds = book.account.orders.filter { it.status == PaperOrderStatus.OPEN }.map(PaperOrder::id).toSet()
         if (book.onPrice(quote.symbol, quote.price)) {
             save(); val delta = book.account.realizedPnl - before
-            if (delta.signum() != 0) { CryptoStrategyService.getInstance().recordPaperOutcome(delta); ForwardTestService.getInstance().recordOutcome(quote.symbol, ForwardStage.PAPER, delta) }
+            book.account.orders.filter { it.id in openIds && it.status == PaperOrderStatus.FILLED }.forEach {
+                CryptoStrategyService.getInstance().recordPaperOrderUpdate(it)
+            }
+            if (delta.signum() != 0) CryptoStrategyService.getInstance().recordPaperOutcome(delta)
         }
     }
     @Synchronized fun onClosedCandle(symbol: String, bar: KlineBar) {
         val before = book.account.realizedPnl
+        val openIds = book.account.orders.filter { it.status == PaperOrderStatus.OPEN }.map(PaperOrder::id).toSet()
         if (book.onBar(symbol, bar)) {
             save(); val delta = book.account.realizedPnl - before
-            if (delta.signum() != 0) { CryptoStrategyService.getInstance().recordPaperOutcome(delta); ForwardTestService.getInstance().recordOutcome(symbol, ForwardStage.PAPER, delta) }
+            book.account.orders.filter { it.id in openIds && it.status == PaperOrderStatus.FILLED }.forEach {
+                CryptoStrategyService.getInstance().recordPaperOrderUpdate(it)
+            }
+            if (delta.signum() != 0) CryptoStrategyService.getInstance().recordPaperOutcome(delta)
         }
     }
     @Synchronized fun reloadConfiguration() { book = newBook(book.account); save() }

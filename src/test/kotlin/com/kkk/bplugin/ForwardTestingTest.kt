@@ -53,7 +53,19 @@ class ForwardTestingTest : TestCase() {
             assertFalse(Files.exists(old))
             val today = root.resolve("${LocalDate.now()}.jsonl")
             assertTrue(Files.readString(today).contains("\"SIGNAL\""))
+            Files.writeString(today, "not-json\n", java.nio.file.StandardOpenOption.APPEND)
+            val loaded = journal.read(LocalDate.now(), LocalDate.now(), sessionId = "s")
+            assertEquals(1, loaded.size)
+            assertEquals(ForwardEventType.SIGNAL, loaded.single().type)
         } finally { root.toFile().deleteRecursively() }
+    }
+
+    fun testHealthPolicyPausesOnlyAtConfiguredThresholds() {
+        val policy = ForwardHealthPolicy(maxSingleGapMillis = 60_000, maxConsecutiveErrors = 3)
+        assertNull(forwardHealthReason(policy, singleGapMillis = 59_999, consecutiveErrors = 2))
+        assertTrue(forwardHealthReason(policy, singleGapMillis = 60_000)!!.contains("行情断档"))
+        assertTrue(forwardHealthReason(policy, consecutiveErrors = 3)!!.contains("订单错误"))
+        assertNull(forwardHealthReason(policy.copy(autoPause = false), singleGapMillis = 600_000, consecutiveErrors = 10))
     }
 
     fun testExportContainsMetricsButNoCredentialFields() {
