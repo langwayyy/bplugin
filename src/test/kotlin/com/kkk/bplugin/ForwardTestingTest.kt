@@ -72,6 +72,7 @@ class ForwardTestingTest : TestCase() {
         assertNull(forwardHealthReason(policy, singleGapMillis = 59_999, consecutiveErrors = 2))
         assertTrue(forwardHealthReason(policy, singleGapMillis = 60_000)!!.contains("行情断档"))
         assertTrue(forwardHealthReason(policy, consecutiveErrors = 3)!!.contains("订单错误"))
+        assertTrue(forwardHealthReason(policy.copy(maxOrderLatencyMillis = 2_000), orderLatencyMillis = 2_000)!!.contains("响应耗时"))
         assertNull(forwardHealthReason(policy.copy(autoPause = false), singleGapMillis = 600_000, consecutiveErrors = 10))
     }
 

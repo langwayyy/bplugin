@@ -64,6 +64,9 @@ data class ForwardSession(
     val fills: Int = 0,
     val blocked: Int = 0,
     val errors: Int = 0,
+    val latencySamples: Int = 0,
+    val totalLatencyMillis: Long = 0,
+    val maxLatencyMillis: Long = 0,
     val consecutiveErrors: Int = 0,
     val healthPauseReason: String = "",
     val monitoringStartedAt: Long = startedAt,
@@ -102,12 +105,14 @@ data class ForwardHealthPolicy(
     val autoPause: Boolean = true,
     val maxSingleGapMillis: Long = 600_000,
     val maxConsecutiveErrors: Int = 3,
+    val maxOrderLatencyMillis: Long? = 10_000,
 )
 internal fun forwardHealthReason(policy: ForwardHealthPolicy, singleGapMillis: Long = 0,
-                                 consecutiveErrors: Int = 0): String? = when {
+                                 consecutiveErrors: Int = 0, orderLatencyMillis: Long = 0): String? = when {
     !policy.autoPause -> null
     singleGapMillis >= policy.maxSingleGapMillis -> "单次行情断档 ${singleGapMillis / 1000} 秒，达到自动暂停阈值"
     consecutiveErrors >= policy.maxConsecutiveErrors -> "连续订单错误 $consecutiveErrors 次，已自动暂停"
+    orderLatencyMillis >= (policy.maxOrderLatencyMillis ?: 10_000) -> "订单响应耗时 $orderLatencyMillis 毫秒，达到自动暂停阈值"
     else -> null
 }
 internal fun forwardStaleMillis(session: ForwardSession, now: Long): Long {
@@ -128,6 +133,7 @@ data class ForwardMetrics(
     val pnl: BigDecimal, val returnPercent: BigDecimal, val uptimePercent: BigDecimal,
     val errorRatePercent: BigDecimal, val fillRatePercent: BigDecimal, val winRatePercent: BigDecimal,
     val profitFactor: BigDecimal, val expectancy: BigDecimal,
+    val averageLatencyMillis: Long,
 )
 data class ForwardTransition(val session: ForwardSession, val events: List<ForwardEvent> = emptyList())
 data class ForwardExecutionDelta(val quantity: BigDecimal, val fee: BigDecimal, val recordedFee: BigDecimal)
@@ -220,7 +226,8 @@ internal object ForwardEngine {
         }
         val expectancy = if (session.closedTrades == 0) BigDecimal.ZERO else session.realizedPnl
             .divide(BigDecimal(session.closedTrades), 8, RoundingMode.HALF_UP)
-        return ForwardMetrics(pnl, returns, uptime, errorRate, fillRate, winRate, profitFactor, expectancy)
+        val averageLatency = if (session.latencySamples == 0) 0 else session.totalLatencyMillis / session.latencySamples
+        return ForwardMetrics(pnl, returns, uptime, errorRate, fillRate, winRate, profitFactor, expectancy, averageLatency)
     }
 
     fun promotion(session: ForwardSession, gate: ForwardGateConfig): ForwardPromotionDecision {
@@ -399,7 +406,7 @@ object ForwardReportExporter {
         val rows = events.filter { it.sessionId == session.id }.sortedByDescending(ForwardEvent::time).joinToString("") {
             "<tr><td>${it.time}</td><td>${it.type}</td><td>${esc(redactForwardMessage(it.message))}</td><td>${it.price ?: "—"}</td><td>${it.pnl ?: "—"}</td></tr>"
         }
-        return """<!doctype html><html><head><meta charset="utf-8"><title>${esc(session.strategyName)} 前向验证</title><style>body{font:14px sans-serif;margin:28px;color:#222}.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.card{background:#f3f5f7;padding:12px;border-radius:6px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px}.audit{font-family:monospace;color:#555}</style></head><body><h1>${esc(session.strategyName)} · ${session.stage.label}</h1><p class="audit">Lineage ${esc(session.lineageId)} · Session ${esc(session.id)} · Snapshot ${esc(session.snapshotHash)}</p><div class="metrics"><div class="card">归因盈亏 ${metrics.pnl}</div><div class="card">收益 ${metrics.returnPercent}%</div><div class="card">回撤 ${session.maxDrawdownPercent}%</div><div class="card">在线率 ${metrics.uptimePercent}%</div><div class="card">胜率 ${metrics.winRatePercent}%</div><div class="card">Profit Factor ${metrics.profitFactor}</div><div class="card">单笔期望 ${metrics.expectancy}</div><div class="card">手续费 ${session.totalFees}</div><div class="card">滑点成本 ${session.totalSlippage}</div></div><h2>资金曲线</h2><svg viewBox="0 0 900 240" width="100%"><polyline fill="none" stroke="#3978b8" stroke-width="2" points="$points"/></svg><h2>事件</h2><table><tr><th>时间</th><th>类型</th><th>说明</th><th>价格</th><th>盈亏</th></tr>$rows</table><p>报告不包含 API Key、Secret 或账户凭据。</p></body></html>"""
+        return """<!doctype html><html><head><meta charset="utf-8"><title>${esc(session.strategyName)} 前向验证</title><style>body{font:14px sans-serif;margin:28px;color:#222}.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.card{background:#f3f5f7;padding:12px;border-radius:6px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px}.audit{font-family:monospace;color:#555}</style></head><body><h1>${esc(session.strategyName)} · ${session.stage.label}</h1><p class="audit">Lineage ${esc(session.lineageId)} · Session ${esc(session.id)} · Snapshot ${esc(session.snapshotHash)}</p><div class="metrics"><div class="card">归因盈亏 ${metrics.pnl}</div><div class="card">收益 ${metrics.returnPercent}%</div><div class="card">回撤 ${session.maxDrawdownPercent}%</div><div class="card">在线率 ${metrics.uptimePercent}%</div><div class="card">胜率 ${metrics.winRatePercent}%</div><div class="card">Profit Factor ${metrics.profitFactor}</div><div class="card">单笔期望 ${metrics.expectancy}</div><div class="card">平均/最大延迟 ${metrics.averageLatencyMillis}/${session.maxLatencyMillis} ms</div><div class="card">手续费 ${session.totalFees}</div><div class="card">滑点成本 ${session.totalSlippage}</div></div><h2>资金曲线</h2><svg viewBox="0 0 900 240" width="100%"><polyline fill="none" stroke="#3978b8" stroke-width="2" points="$points"/></svg><h2>事件</h2><table><tr><th>时间</th><th>类型</th><th>说明</th><th>价格</th><th>盈亏</th></tr>$rows</table><p>报告不包含 API Key、Secret 或账户凭据。</p></body></html>"""
     }
     fun json(session: ForwardSession, events: List<ForwardEvent>, generatedAt: Long = System.currentTimeMillis()): String {
         val safeEvents = events.filter { it.sessionId == session.id }.sortedBy(ForwardEvent::time)
@@ -478,7 +485,8 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
     @Synchronized fun healthPolicy() = healthPolicy
     @Synchronized fun setHealthPolicy(value: ForwardHealthPolicy) {
         healthPolicy = value.copy(maxSingleGapMillis = value.maxSingleGapMillis.coerceIn(30_000, 86_400_000),
-            maxConsecutiveErrors = value.maxConsecutiveErrors.coerceIn(1, 100)); encode()
+            maxConsecutiveErrors = value.maxConsecutiveErrors.coerceIn(1, 100),
+            maxOrderLatencyMillis = (value.maxOrderLatencyMillis ?: 10_000).coerceIn(500, 300_000)); encode()
     }
     @Synchronized fun setGate(value: ForwardGateConfig) {
         gate = value.copy(minSignals = value.minSignals.coerceIn(1, 10_000),
@@ -598,9 +606,13 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
                                   price: BigDecimal?, quantity: BigDecimal?, latencyMillis: Long? = null, filled: Boolean = success,
                                   side: PaperOrderSide? = null, fee: BigDecimal = BigDecimal.ZERO) {
         val source = sessionFor(strategyId) ?: return
+        val observedLatency = latencyMillis?.coerceAtLeast(0)
         var next = source.copy(orders = source.orders + 1, fills = source.fills + if (filled) 1 else 0,
             errors = source.errors + if (success) 0 else 1,
-            consecutiveErrors = if (success) 0 else source.consecutiveErrors + 1)
+            consecutiveErrors = if (success) 0 else source.consecutiveErrors + 1,
+            latencySamples = source.latencySamples + if (observedLatency != null) 1 else 0,
+            totalLatencyMillis = source.totalLatencyMillis + (observedLatency ?: 0),
+            maxLatencyMillis = maxOf(source.maxLatencyMillis, observedLatency ?: 0))
         if (filled && side != null && price != null && quantity != null) {
             next = ForwardEngine.attributeFill(next, side, price, quantity, fee).copy(
                 executionQuantities = next.executionQuantities.orEmpty() + (executionId to quantity.toPlainString()))
@@ -613,10 +625,15 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
             record(event(next, ForwardEventType.HEALTH_PAUSE, reason, executionId, price, quantity))
             CryptoNotifications.warn("前向验证已自动暂停：${next.strategyName}", reason)
         }
+        if (success && observedLatency != null) forwardHealthReason(healthPolicy, orderLatencyMillis = observedLatency)?.let { reason ->
+            next = next.copy(status = ForwardSessionStatus.PAUSED, healthPauseReason = reason, lastMarketAt = 0)
+            record(event(next, ForwardEventType.HEALTH_PAUSE, reason, executionId, price, quantity, observedLatency))
+            CryptoNotifications.warn("前向验证已自动暂停：${next.strategyName}", reason)
+        }
         val pnl = (next.realizedPnl - source.realizedPnl).takeIf { filled && side == PaperOrderSide.SELL }
         replace(next); record(event(next, if (!success) ForwardEventType.ERROR else if (filled && side == PaperOrderSide.SELL) ForwardEventType.EXIT
             else if (filled) ForwardEventType.FILL else ForwardEventType.ORDER,
-            message, executionId, price, quantity, latencyMillis, pnl)); encode()
+            message, executionId, price, quantity, observedLatency, pnl)); encode()
     }
     @Synchronized fun recordBlocked(strategyId: String, executionId: String, message: String, price: BigDecimal? = null) {
         val source = sessionFor(strategyId) ?: return

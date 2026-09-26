@@ -200,15 +200,18 @@ class ForwardTestingPanel(private val project: Project?, private val ruleProvide
         val enabled = JCheckBox("达到阈值时自动暂停", current.autoPause)
         val gapSeconds = JTextField((current.maxSingleGapMillis / 1000).toString(), 8)
         val errors = JTextField(current.maxConsecutiveErrors.toString(), 8)
+        val latency = JTextField((current.maxOrderLatencyMillis ?: 10_000).toString(), 8)
         val panel = JPanel(java.awt.GridLayout(0, 2, 8, 6)).apply {
             add(enabled); add(JLabel("")); add(JLabel("单次行情断档阈值（秒）")); add(gapSeconds)
             add(JLabel("连续订单错误阈值")); add(errors)
+            add(JLabel("单次订单延迟阈值（毫秒）")); add(latency)
         }
         if (JOptionPane.showConfirmDialog(this, panel, "前向验证健康策略", JOptionPane.OK_CANCEL_OPTION,
                 JOptionPane.PLAIN_MESSAGE) != JOptionPane.OK_OPTION) return
         val seconds = gapSeconds.text.toLongOrNull() ?: return message("断档阈值格式无效")
         val count = errors.text.toIntOrNull() ?: return message("错误阈值格式无效")
-        service.setHealthPolicy(ForwardHealthPolicy(enabled.isSelected, seconds * 1000, count)); refresh(true)
+        val latencyMillis = latency.text.toLongOrNull() ?: return message("延迟阈值格式无效")
+        service.setHealthPolicy(ForwardHealthPolicy(enabled.isSelected, seconds * 1000, count, latencyMillis)); refresh(true)
     }
     private fun export(format: String) {
         val item = selectedSession() ?: return message("请选择会话")
@@ -243,7 +246,7 @@ class ForwardTestingPanel(private val project: Project?, private val ruleProvide
         if (item == null) { summary.text = "尚无前向验证会话"; return }
         val metrics = ForwardEngine.metrics(item)
         val health = item.healthPauseReason.takeIf(String::isNotBlank)?.let { " · 暂停原因 $it" }.orEmpty()
-        summary.text = "${item.strategyName} · ${item.stage.label} · ${item.status.label} · 快照 ${item.snapshotHash.take(12)} · 归因盈亏 ${marketPrice(metrics.pnl, 2)} · 胜率 ${marketPrice(metrics.winRatePercent, 2)}% · PF ${marketPrice(metrics.profitFactor, 2)} · 单笔期望 ${marketPrice(metrics.expectancy, 2)} · 手续费 ${marketPrice(item.totalFees, 2)} · 回撤 ${marketPrice(item.maxDrawdownPercent, 2)}% · 在线率 ${marketPrice(metrics.uptimePercent, 2)}% · 错误率 ${marketPrice(metrics.errorRatePercent, 2)}%$health"
+        summary.text = "${item.strategyName} · ${item.stage.label} · ${item.status.label} · 快照 ${item.snapshotHash.take(12)} · 归因盈亏 ${marketPrice(metrics.pnl, 2)} · 胜率 ${marketPrice(metrics.winRatePercent, 2)}% · PF ${marketPrice(metrics.profitFactor, 2)} · 单笔期望 ${marketPrice(metrics.expectancy, 2)} · 延迟 ${metrics.averageLatencyMillis}/${item.maxLatencyMillis}ms · 手续费 ${marketPrice(item.totalFees, 2)} · 回撤 ${marketPrice(item.maxDrawdownPercent, 2)}% · 在线率 ${marketPrice(metrics.uptimePercent, 2)}% · 错误率 ${marketPrice(metrics.errorRatePercent, 2)}%$health"
     }
     private fun message(value: String) { summary.text = value }
     private fun table(model: AbstractTableModel) = JBTable(model).apply { rowHeight = JBUI.scale(28); setShowGrid(false); autoCreateRowSorter = true; setSelectionMode(ListSelectionModel.SINGLE_SELECTION) }
