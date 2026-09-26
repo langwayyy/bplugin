@@ -81,9 +81,14 @@ class ForwardTestingPanel(private val project: Project?, private val ruleProvide
                     add(historyButton)
                     add(JBLabel("事件")); add(eventType); add(JBLabel("搜索")); add(eventSearch)
                     add(JButton("筛选").apply { addActionListener { updateEventView() } })
+                })
+                add(JPanel(FlowLayout(FlowLayout.LEFT)).apply {
+                    add(JBLabel("报告"))
                     add(JButton("导出 CSV").apply { addActionListener { export("csv") } })
                     add(JButton("导出 HTML").apply { addActionListener { export("html") } })
                     add(JButton("导出 JSON").apply { addActionListener { export("json") } })
+                    add(JButton("验证 JSON").apply { addActionListener { verifyJson() } })
+                    add(JButton("清理已结束").apply { addActionListener { clearCompleted() } })
                 })
             }, BorderLayout.NORTH)
             add(summary, BorderLayout.SOUTH)
@@ -217,6 +222,21 @@ class ForwardTestingPanel(private val project: Project?, private val ruleProvide
         }
         chooser.selectedFile.writeText(content, Charsets.UTF_8)
         message("报告已导出：${chooser.selectedFile.absolutePath}")
+    }
+    private fun verifyJson() {
+        val chooser = JFileChooser()
+        if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) return
+        val file = chooser.selectedFile
+        if (!file.isFile || file.length() > 20L * 1024 * 1024) return message("请选择不超过 20 MB 的 JSON 审计包")
+        val valid = runCatching { ForwardReportExporter.verifyJson(file.readText(Charsets.UTF_8)) }.getOrDefault(false)
+        message(if (valid) "JSON 审计包完整性校验通过" else "JSON 审计包无效或内容已被修改")
+    }
+    private fun clearCompleted() {
+        val count = sessions.count { it.status == ForwardSessionStatus.COMPLETED }
+        if (count == 0) return message("没有可清理的已结束会话")
+        if (Messages.showYesNoDialog(project, "从会话列表清理 $count 个已结束会话？磁盘事件日志仍会按保留期保存。",
+                "清理前向会话", null) != Messages.YES) return
+        service.clearCompleted(); refresh(true); message("已清理 $count 个会话，磁盘事件未删除")
     }
     private fun updateSummary() {
         val item = selectedSession()

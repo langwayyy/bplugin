@@ -133,6 +133,11 @@ data class ForwardTransition(val session: ForwardSession, val events: List<Forwa
 data class ForwardExecutionDelta(val quantity: BigDecimal, val fee: BigDecimal, val recordedFee: BigDecimal)
 internal fun mergeForwardEvents(recent: List<ForwardEvent>, historical: List<ForwardEvent>, limit: Int = 5_000): List<ForwardEvent> =
     (recent + historical).distinctBy(ForwardEvent::id).sortedByDescending(ForwardEvent::time).take(limit)
+internal fun retainForwardSessions(source: List<ForwardSession>, limit: Int = 100): List<ForwardSession> {
+    val active = source.filter { it.status != ForwardSessionStatus.COMPLETED }
+    val completed = source.filter { it.status == ForwardSessionStatus.COMPLETED }
+    return (active + completed.take((limit - active.size).coerceAtLeast(0))).distinctBy(ForwardSession::id)
+}
 internal fun forwardExecutionDelta(previousQuantity: BigDecimal, executedQuantity: BigDecimal,
                                    previousFee: BigDecimal, cumulativeFee: BigDecimal) = ForwardExecutionDelta(
     (executedQuantity - previousQuantity).max(BigDecimal.ZERO),
@@ -502,7 +507,8 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
             ruleSnapshot = rule, parentSessionId = parentSessionId, lineageId = lineageId ?: UUID.randomUUID().toString(),
             startedAt = now, expectedIntervalMillis = expectedInterval(rule), initialEquity = equity,
             currentEquity = equity, peakEquity = equity, cash = equity, equityCurve = listOf(ForwardPoint(now, equity)))
-        sessions.add(0, session); record(event(session, ForwardEventType.SESSION_START, "开始 ${stage.label} 前向验证")); encode(); session
+        sessions.add(0, session); sessions = retainForwardSessions(sessions).toMutableList()
+        record(event(session, ForwardEventType.SESSION_START, "开始 ${stage.label} 前向验证")); encode(); session
     }
     @Synchronized fun pause(id: String) = changeStatus(id, ForwardSessionStatus.PAUSED, ForwardEventType.SESSION_PAUSE, "会话已暂停")
     @Synchronized fun resume(id: String): Result<ForwardSession> = runCatching {
@@ -703,7 +709,7 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
     private fun encode(force: Boolean = true) {
         val now = System.currentTimeMillis()
         if (!force && now - lastEncodedAt < 5_000) return
-        stored.sessionsJson = gson.toJson(sessions.take(100)); stored.eventsJson = gson.toJson(events.take(1000)); stored.gateJson = gson.toJson(gate)
+        stored.sessionsJson = gson.toJson(retainForwardSessions(sessions)); stored.eventsJson = gson.toJson(events.take(1000)); stored.gateJson = gson.toJson(gate)
         stored.healthPolicyJson = gson.toJson(healthPolicy)
         stored.pendingJournalJson = gson.toJson(pendingJournal.takeLast(500))
         lastEncodedAt = now

@@ -123,6 +123,16 @@ class ForwardTestingTest : TestCase() {
         assertEquals(listOf("new", "same"), mergeForwardEvents(listOf(newer, base), listOf(base)).map(ForwardEvent::id))
     }
 
+    fun testSessionRetentionNeverDropsActiveSessions() {
+        val active = (1..3).map { session(rule().copy(id = "a$it")).copy(id = "active-$it") }
+        val completed = (1..10).map { session(rule().copy(id = "c$it")).copy(id = "done-$it",
+            status = ForwardSessionStatus.COMPLETED) }
+        val retained = retainForwardSessions(completed + active, limit = 5)
+        assertEquals(5, retained.size)
+        assertTrue(active.all { candidate -> retained.any { it.id == candidate.id } })
+        assertEquals(2, retained.count { it.status == ForwardSessionStatus.COMPLETED })
+    }
+
     fun testJournalReadKeepsNewestEventsWithinLimit() {
         val root = Files.createTempDirectory("quiet-forward-limit")
         try {
