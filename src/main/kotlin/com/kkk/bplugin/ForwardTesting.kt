@@ -42,6 +42,8 @@ data class ForwardSession(
     val snapshotHash: String = forwardRuleFingerprint(ruleSnapshot),
     val status: ForwardSessionStatus = ForwardSessionStatus.RUNNING,
     val startedAt: Long = System.currentTimeMillis(),
+    val runStartedAt: Long = startedAt,
+    val activeMillis: Long = 0,
     val endedAt: Long? = null,
     val expectedIntervalMillis: Long = 120_000,
     val initialEquity: BigDecimal = BigDecimal("10000"),
@@ -131,6 +133,11 @@ internal fun forwardStaleMillis(session: ForwardSession, now: Long): Long {
     val reference = session.lastMarketAt.takeIf { it > 0 } ?: maxOf(session.startedAt, session.monitoringStartedAt)
     return (now - reference - session.expectedIntervalMillis).coerceAtLeast(0)
 }
+internal fun forwardActiveMillis(session: ForwardSession, now: Long): Long = session.activeMillis +
+    if (session.status == ForwardSessionStatus.RUNNING) (now - session.runStartedAt).coerceAtLeast(0) else 0
+internal fun pauseForwardSession(session: ForwardSession, reason: String, now: Long = System.currentTimeMillis()): ForwardSession =
+    session.copy(status = ForwardSessionStatus.PAUSED, activeMillis = forwardActiveMillis(session, now), runStartedAt = 0,
+        healthPauseReason = reason.take(240), lastMarketAt = 0)
 internal fun forwardRuleFingerprint(rule: CryptoStrategyRule): String {
     val canonical = listOf(rule.id, rule.name, rule.symbol, rule.condition.name, rule.threshold.toPlainString(),
         rule.fastWindow, rule.slowWindow, rule.action.name, rule.side.name, rule.orderTemplate.name,
@@ -156,9 +163,10 @@ internal fun retainForwardSessions(source: List<ForwardSession>, limit: Int = 10
     val completed = source.filter { it.status == ForwardSessionStatus.COMPLETED }
     return (active + completed.take((limit - active.size).coerceAtLeast(0))).distinctBy(ForwardSession::id)
 }
-internal fun pauseRunningForwardSessions(source: List<ForwardSession>, reason: String): Pair<List<ForwardSession>, List<ForwardSession>> {
+internal fun pauseRunningForwardSessions(source: List<ForwardSession>, reason: String,
+                                         now: Long = System.currentTimeMillis()): Pair<List<ForwardSession>, List<ForwardSession>> {
     val changed = source.filter { it.status == ForwardSessionStatus.RUNNING }.map {
-        it.copy(status = ForwardSessionStatus.PAUSED, healthPauseReason = reason.take(240), lastMarketAt = 0)
+        pauseForwardSession(it, reason, now)
     }
     val byId = changed.associateBy(ForwardSession::id)
     return source.map { byId[it.id] ?: it } to changed
@@ -469,6 +477,8 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
                 executionQuantities = session.executionQuantities.orEmpty(), terminalExecutions = session.terminalExecutions.orEmpty(),
                 executionFees = session.executionFees.orEmpty(),
                 executionPnls = session.executionPnls.orEmpty(),
+                runStartedAt = session.runStartedAt.takeIf { it > 0 }
+                    ?: if (session.status == ForwardSessionStatus.RUNNING) session.startedAt else 0,
                 lineageId = runCatching { session.lineageId }.getOrNull().orEmpty().ifBlank { session.id },
                 snapshotHash = runCatching { session.snapshotHash }.getOrNull().orEmpty().ifBlank { forwardRuleFingerprint(session.ruleSnapshot) })
         }.toMutableList()
@@ -479,7 +489,9 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
             .getOrNull() ?: ForwardHealthPolicy())
         val interrupted = sessions.filter { it.status == ForwardSessionStatus.RUNNING }
         interrupted.forEach { source ->
-            val next = source.copy(status = ForwardSessionStatus.RECOVERY_REQUIRED, lastMarketAt = 0,
+            val cutoff = source.lastMarketAt.takeIf { it >= source.runStartedAt } ?: source.runStartedAt
+            val next = source.copy(status = ForwardSessionStatus.RECOVERY_REQUIRED, lastMarketAt = 0, runStartedAt = 0,
+                activeMillis = source.activeMillis + (cutoff - source.runStartedAt).coerceAtLeast(0),
                 healthPauseReason = "插件重启后需人工确认恢复")
             replace(next); record(event(next, ForwardEventType.RECOVERY, next.healthPauseReason))
         }
@@ -557,13 +569,15 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
             require(CryptoTestnetTradingService.getInstance().hasCredentials()) { "测试网凭据不可用，不能恢复" }
             require(environmentEquity(source.stage).signum() > 0) { "测试网资产尚未同步，不能恢复" }
         }
-        val next = source.copy(status = ForwardSessionStatus.RUNNING, lastMarketAt = 0,
+        val next = source.copy(status = ForwardSessionStatus.RUNNING, lastMarketAt = 0, runStartedAt = System.currentTimeMillis(),
             monitoringStartedAt = System.currentTimeMillis(), healthPauseReason = "", consecutiveErrors = 0)
         replace(next); record(event(next, ForwardEventType.SESSION_RESUME, "恢复校验通过，会话已恢复")); encode(); next
     }
     @Synchronized fun finish(id: String): Boolean {
         val session = sessions.firstOrNull { it.id == id && it.status != ForwardSessionStatus.COMPLETED } ?: return false
-        replace(session.copy(status = ForwardSessionStatus.COMPLETED, endedAt = System.currentTimeMillis()))
+        val now = System.currentTimeMillis()
+        replace(session.copy(status = ForwardSessionStatus.COMPLETED, endedAt = now,
+            activeMillis = forwardActiveMillis(session, now), runStartedAt = 0))
         record(event(session, ForwardEventType.SESSION_END, "会话已结束")); encode(); return true
     }
     @Synchronized fun promotion(id: String): ForwardPromotionDecision = sessions.firstOrNull { it.id == id }
@@ -585,7 +599,7 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
             transition.events.forEach(::record)
             val newGap = next.gapMillis - source.gapMillis
             forwardHealthReason(healthPolicy, singleGapMillis = newGap)?.let { reason ->
-                next = next.copy(status = ForwardSessionStatus.PAUSED, healthPauseReason = reason, lastMarketAt = 0)
+                next = pauseForwardSession(next, reason, System.currentTimeMillis())
                 record(event(next, ForwardEventType.HEALTH_PAUSE, reason))
                 CryptoNotifications.warn("前向验证已自动暂停：${next.strategyName}", reason)
             }
@@ -603,9 +617,8 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
         sessions.filter { it.status == ForwardSessionStatus.RUNNING }.toList().forEach { source ->
             val stale = forwardStaleMillis(source, now)
             forwardHealthReason(healthPolicy, singleGapMillis = stale, orderCount = source.orders,
-                sessionRuntimeMillis = (now - source.startedAt).coerceAtLeast(0))?.let { reason ->
-                val next = source.copy(status = ForwardSessionStatus.PAUSED, healthPauseReason = reason,
-                    gapMillis = source.gapMillis + stale, lastMarketAt = 0)
+                sessionRuntimeMillis = forwardActiveMillis(source, now))?.let { reason ->
+                val next = pauseForwardSession(source, reason, now).copy(gapMillis = source.gapMillis + stale)
                 replace(next); record(event(next, ForwardEventType.HEALTH_PAUSE, "$reason（健康巡检）"))
                 CryptoNotifications.warn("前向验证已自动暂停：${next.strategyName}", reason)
                 changed = true
@@ -648,8 +661,8 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
         if (!success) next = next.copy(terminalExecutions = next.terminalExecutions.orEmpty() + executionId)
         forwardHealthReason(healthPolicy, consecutiveErrors = if (success) 0 else next.consecutiveErrors,
             orderLatencyMillis = observedLatency ?: 0, orderCount = next.orders,
-            sessionRuntimeMillis = (System.currentTimeMillis() - next.startedAt).coerceAtLeast(0))?.let { reason ->
-            next = next.copy(status = ForwardSessionStatus.PAUSED, healthPauseReason = reason, lastMarketAt = 0)
+            sessionRuntimeMillis = forwardActiveMillis(next, System.currentTimeMillis()))?.let { reason ->
+            next = pauseForwardSession(next, reason)
             record(event(next, ForwardEventType.HEALTH_PAUSE, reason, executionId, price, quantity, observedLatency))
             CryptoNotifications.warn("前向验证已自动暂停：${next.strategyName}", reason)
         }
@@ -694,7 +707,7 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
             next = next.copy(errors = next.errors + 1, consecutiveErrors = next.consecutiveErrors + 1,
                 terminalExecutions = next.terminalExecutions.orEmpty() + executionId)
             forwardHealthReason(healthPolicy, consecutiveErrors = next.consecutiveErrors)?.let { reason ->
-                next = next.copy(status = ForwardSessionStatus.PAUSED, healthPauseReason = reason, lastMarketAt = 0)
+                next = pauseForwardSession(next, reason)
                 record(event(next, ForwardEventType.HEALTH_PAUSE, reason, executionId, price))
                 CryptoNotifications.warn("前向验证已自动暂停：${next.strategyName}", reason)
             }
@@ -706,11 +719,13 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
 
     private fun changeStatus(id: String, status: ForwardSessionStatus, type: ForwardEventType, message: String): Boolean {
         val source = sessions.firstOrNull { it.id == id && it.status != ForwardSessionStatus.COMPLETED } ?: return false
-        replace(source.copy(status = status, lastMarketAt = if (status == ForwardSessionStatus.RUNNING) 0 else source.lastMarketAt,
-            monitoringStartedAt = if (status == ForwardSessionStatus.RUNNING) System.currentTimeMillis() else source.monitoringStartedAt,
-            healthPauseReason = if (status == ForwardSessionStatus.RUNNING) "" else source.healthPauseReason.ifBlank { message },
-            consecutiveErrors = if (status == ForwardSessionStatus.RUNNING) 0 else source.consecutiveErrors))
-        record(event(source, type, message)); encode(); return true
+        val now = System.currentTimeMillis()
+        val next = if (status == ForwardSessionStatus.RUNNING) source.copy(status = status, lastMarketAt = 0,
+            runStartedAt = now, monitoringStartedAt = now,
+            healthPauseReason = "",
+            consecutiveErrors = 0) else pauseForwardSession(source, source.healthPauseReason.ifBlank { message }, now)
+        replace(next)
+        record(event(next, type, message)); encode(); return true
     }
     private fun replace(value: ForwardSession) { sessions = sessions.map { if (it.id == value.id) value else it }.toMutableList() }
     private fun record(value: ForwardEvent) {

@@ -140,11 +140,20 @@ class ForwardTestingTest : TestCase() {
         val running = session(rule()).copy(id = "running")
         val alreadyPaused = session(rule()).copy(id = "paused", status = ForwardSessionStatus.PAUSED)
         val completed = session(rule()).copy(id = "done", status = ForwardSessionStatus.COMPLETED)
-        val (all, changed) = pauseRunningForwardSessions(listOf(running, alreadyPaused, completed), "人工熔断")
+        val (all, changed) = pauseRunningForwardSessions(listOf(running, alreadyPaused, completed), "人工熔断", 1_000)
         assertEquals(listOf("running"), changed.map(ForwardSession::id))
         assertEquals(ForwardSessionStatus.PAUSED, all.first { it.id == "running" }.status)
         assertEquals("人工熔断", all.first { it.id == "running" }.healthPauseReason)
         assertEquals(ForwardSessionStatus.COMPLETED, all.first { it.id == "done" }.status)
+    }
+
+    fun testActiveDurationExcludesPausedTime() {
+        val running = session(rule()).copy(startedAt = 1_000, runStartedAt = 1_000, activeMillis = 100)
+        assertEquals(600, forwardActiveMillis(running, 1_500))
+        val paused = pauseForwardSession(running, "pause", 1_500)
+        assertEquals(600, forwardActiveMillis(paused, 10_000))
+        val resumed = paused.copy(status = ForwardSessionStatus.RUNNING, runStartedAt = 2_000)
+        assertEquals(1_000, forwardActiveMillis(resumed, 2_400))
     }
 
     fun testJournalReadKeepsNewestEventsWithinLimit() {
