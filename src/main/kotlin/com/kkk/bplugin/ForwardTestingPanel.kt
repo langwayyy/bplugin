@@ -26,8 +26,11 @@ class ForwardTestingPanel(private val project: Project?, private val ruleProvide
     private val service = ForwardTestService.getInstance()
     private var sessions = emptyList<ForwardSession>()
     private var events = emptyList<ForwardEvent>()
+    private var visibleEvents = emptyList<ForwardEvent>()
     private val stage = ComboBox(ForwardStage.entries.toTypedArray())
     private val summary = JBLabel("尚无前向验证会话")
+    private val eventType = ComboBox(arrayOf("全部") + ForwardEventType.entries.map(ForwardEventType::name).toTypedArray())
+    private val eventSearch = JTextField(12)
     private val chart = ForwardEquityChart { selectedSession() }
     private val sessionModel = object : AbstractTableModel() {
         override fun getRowCount() = sessions.size
@@ -44,10 +47,10 @@ class ForwardTestingPanel(private val project: Project?, private val ruleProvide
         }
     }
     private val eventModel = object : AbstractTableModel() {
-        override fun getRowCount() = filteredEvents().size
+        override fun getRowCount() = visibleEvents.size
         override fun getColumnCount() = 9
         override fun getColumnName(column: Int) = arrayOf("时间", "类型", "阶段", "策略", "交易对", "价格", "数量", "盈亏", "说明")[column]
-        override fun getValueAt(row: Int, column: Int): Any = filteredEvents()[row].let { item -> when (column) {
+        override fun getValueAt(row: Int, column: Int): Any = visibleEvents[row].let { item -> when (column) {
             0 -> TIME.format(Instant.ofEpochMilli(item.time)); 1 -> item.type.name; 2 -> item.stage.label; 3 -> item.strategyName; 4 -> item.symbol
             5 -> item.price?.let(::marketPrice) ?: "—"; 6 -> item.quantity?.let(::marketPrice) ?: "—"
             7 -> item.pnl?.let { marketPrice(it, 2) } ?: "—"; else -> item.message
@@ -60,17 +63,24 @@ class ForwardTestingPanel(private val project: Project?, private val ruleProvide
 
     init {
         add(JPanel(BorderLayout()).apply {
-            add(JPanel(FlowLayout(FlowLayout.LEFT)).apply {
-                add(JBLabel("新会话阶段")); add(stage)
-                add(JButton("开始").apply { addActionListener { start() } })
-                add(JButton("暂停 / 恢复").apply { addActionListener { togglePause() } })
-                add(JButton("结束").apply { addActionListener { finish() } })
-                add(JButton("晋级下一阶段").apply { addActionListener { promote() } })
-                add(JButton("晋级门槛").apply { addActionListener { editGate() } })
-                add(JButton("健康策略").apply { addActionListener { editHealthPolicy() } })
-                add(JButton("加载30天日志").apply { addActionListener { includeHistory = true; refresh(true) } })
-                add(JButton("导出 CSV").apply { addActionListener { export(false) } })
-                add(JButton("导出 HTML").apply { addActionListener { export(true) } })
+            add(JPanel().apply {
+                layout = BoxLayout(this, BoxLayout.Y_AXIS)
+                add(JPanel(FlowLayout(FlowLayout.LEFT)).apply {
+                    add(JBLabel("新会话阶段")); add(stage)
+                    add(JButton("开始").apply { addActionListener { start() } })
+                    add(JButton("暂停 / 恢复").apply { addActionListener { togglePause() } })
+                    add(JButton("结束").apply { addActionListener { finish() } })
+                    add(JButton("晋级下一阶段").apply { addActionListener { promote() } })
+                })
+                add(JPanel(FlowLayout(FlowLayout.LEFT)).apply {
+                    add(JButton("晋级门槛").apply { addActionListener { editGate() } })
+                    add(JButton("健康策略").apply { addActionListener { editHealthPolicy() } })
+                    add(JButton("加载30天日志").apply { addActionListener { includeHistory = true; refresh(true) } })
+                    add(JBLabel("事件")); add(eventType); add(JBLabel("搜索")); add(eventSearch)
+                    add(JButton("筛选").apply { addActionListener { updateEventView() } })
+                    add(JButton("导出 CSV").apply { addActionListener { export(false) } })
+                    add(JButton("导出 HTML").apply { addActionListener { export(true) } })
+                })
             }, BorderLayout.NORTH)
             add(summary, BorderLayout.SOUTH)
         }, BorderLayout.NORTH)
@@ -79,7 +89,7 @@ class ForwardTestingPanel(private val project: Project?, private val ruleProvide
             addTab("事件追踪", scroll(eventTable))
             addTab("资金曲线", chart)
         }, BorderLayout.CENTER)
-        sessionTable.selectionModel.addListSelectionListener { if (!it.valueIsAdjusting) { eventModel.fireTableDataChanged(); chart.repaint(); updateSummary() } }
+        sessionTable.selectionModel.addListSelectionListener { if (!it.valueIsAdjusting) { updateEventView(); chart.repaint(); updateSummary() } }
         refresh(true)
     }
 
@@ -89,13 +99,22 @@ class ForwardTestingPanel(private val project: Project?, private val ruleProvide
         val next = "${nextSessions.take(50)}|${nextEvents.take(50)}|${service.gate()}|${service.healthPolicy()}|$includeHistory"
         if (!force && next == fingerprint) return
         fingerprint = next; sessions = nextSessions; events = nextEvents
-        sessionModel.fireTableDataChanged(); eventModel.fireTableDataChanged(); chart.repaint(); updateSummary()
+        sessionModel.fireTableDataChanged(); updateEventView(); chart.repaint(); updateSummary()
     }
     private fun selectedSession(): ForwardSession? {
         val row = sessionTable.selectedRow
         return if (row >= 0) sessions.getOrNull(sessionTable.convertRowIndexToModel(row)) else sessions.firstOrNull()
     }
-    private fun filteredEvents(): List<ForwardEvent> = selectedSession()?.let { session -> events.filter { it.sessionId == session.id } } ?: events
+    private fun updateEventView() {
+        val selectedType = (eventType.selectedItem as? String)?.takeUnless { it == "全部" }
+        val query = eventSearch.text.trim()
+        visibleEvents = events.asSequence()
+            .filter { selectedSession()?.id?.let { id -> it.sessionId == id } ?: true }
+            .filter { selectedType == null || it.type.name == selectedType }
+            .filter { query.isBlank() || listOf(it.message, it.executionId, it.strategyName, it.symbol).any { value -> value.contains(query, true) } }
+            .toList()
+        eventModel.fireTableDataChanged()
+    }
     private fun start() {
         val rule = ruleProvider() ?: return message("请先在“策略”页选择一个策略")
         val target = stage.selectedItem as ForwardStage
@@ -107,8 +126,8 @@ class ForwardTestingPanel(private val project: Project?, private val ruleProvide
     private fun togglePause() {
         val item = selectedSession() ?: return message("请选择会话")
         if (item.status == ForwardSessionStatus.COMPLETED) return message("已结束的会话不能恢复")
-        if (item.status == ForwardSessionStatus.RUNNING) service.pause(item.id) else service.resume(item.id)
-        refresh(true)
+        if (item.status == ForwardSessionStatus.RUNNING) { service.pause(item.id); refresh(true) }
+        else service.resume(item.id).onSuccess { refresh(true) }.onFailure { message(it.message ?: "恢复校验失败") }
     }
     private fun finish() {
         val item = selectedSession() ?: return message("请选择会话")

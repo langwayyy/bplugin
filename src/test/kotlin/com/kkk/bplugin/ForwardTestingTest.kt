@@ -68,6 +68,14 @@ class ForwardTestingTest : TestCase() {
         assertNull(forwardHealthReason(policy.copy(autoPause = false), singleGapMillis = 600_000, consecutiveErrors = 10))
     }
 
+    fun testStaleHealthClockUsesResumeBaselineBeforeFirstMarketUpdate() {
+        val source = session(rule()).copy(startedAt = 1_000, monitoringStartedAt = 50_000,
+            expectedIntervalMillis = 10_000, lastMarketAt = 0)
+        assertEquals(0, forwardStaleMillis(source, 59_999))
+        assertEquals(5_000, forwardStaleMillis(source, 65_000))
+        assertEquals(2_000, forwardStaleMillis(source.copy(lastMarketAt = 60_000), 72_000))
+    }
+
     fun testExportContainsMetricsButNoCredentialFields() {
         val session = session(rule()).copy(status = ForwardSessionStatus.COMPLETED, endedAt = 2_000)
         val event = ForwardEvent(sessionId = session.id, time = 1, type = ForwardEventType.ERROR, stage = ForwardStage.SHADOW,

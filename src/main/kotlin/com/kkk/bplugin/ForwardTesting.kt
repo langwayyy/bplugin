@@ -56,6 +56,7 @@ data class ForwardSession(
     val errors: Int = 0,
     val consecutiveErrors: Int = 0,
     val healthPauseReason: String = "",
+    val monitoringStartedAt: Long = startedAt,
     val lastMarketAt: Long = 0,
     val gapMillis: Long = 0,
     val pendingSide: PaperOrderSide? = null,
@@ -93,6 +94,10 @@ internal fun forwardHealthReason(policy: ForwardHealthPolicy, singleGapMillis: L
     singleGapMillis >= policy.maxSingleGapMillis -> "单次行情断档 ${singleGapMillis / 1000} 秒，达到自动暂停阈值"
     consecutiveErrors >= policy.maxConsecutiveErrors -> "连续订单错误 $consecutiveErrors 次，已自动暂停"
     else -> null
+}
+internal fun forwardStaleMillis(session: ForwardSession, now: Long): Long {
+    val reference = session.lastMarketAt.takeIf { it > 0 } ?: maxOf(session.startedAt, session.monitoringStartedAt)
+    return (now - reference - session.expectedIntervalMillis).coerceAtLeast(0)
 }
 data class ForwardPromotionDecision(val allowed: Boolean, val nextStage: ForwardStage?, val reasons: List<String>)
 data class ForwardMetrics(
@@ -383,7 +388,23 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
         sessions.add(0, session); record(event(session, ForwardEventType.SESSION_START, "开始 ${stage.label} 前向验证")); encode(); session
     }
     @Synchronized fun pause(id: String) = changeStatus(id, ForwardSessionStatus.PAUSED, ForwardEventType.SESSION_PAUSE, "会话已暂停")
-    @Synchronized fun resume(id: String) = changeStatus(id, ForwardSessionStatus.RUNNING, ForwardEventType.SESSION_RESUME, "会话已恢复")
+    @Synchronized fun resume(id: String): Result<ForwardSession> = runCatching {
+        val source = sessions.firstOrNull { it.id == id && it.status != ForwardSessionStatus.COMPLETED } ?: error("会话不存在或已结束")
+        val quote = CryptoMarketService.getInstance().quotes[source.symbol] ?: error("${source.symbol} 尚无行情，不能恢复")
+        val age = System.currentTimeMillis() - quote.updatedAt.toEpochMilli()
+        require(age <= maxOf(180_000, healthPolicy.maxSingleGapMillis)) { "${source.symbol} 行情已过期，不能恢复" }
+        val unresolved = CryptoStrategyService.getInstance().executions().count {
+            it.strategyId == source.strategyId && it.state in setOf(StrategyExecutionState.SUBMITTING, StrategyExecutionState.UNKNOWN)
+        }
+        require(unresolved == 0) { "仍有 $unresolved 笔结果未知的订单，请先完成订单恢复与对账" }
+        if (source.stage in setOf(ForwardStage.TESTNET_MANUAL, ForwardStage.TESTNET_AUTO)) {
+            require(CryptoTestnetTradingService.getInstance().hasCredentials()) { "测试网凭据不可用，不能恢复" }
+            require(environmentEquity(source.stage).signum() > 0) { "测试网资产尚未同步，不能恢复" }
+        }
+        val next = source.copy(status = ForwardSessionStatus.RUNNING, lastMarketAt = 0,
+            monitoringStartedAt = System.currentTimeMillis(), healthPauseReason = "", consecutiveErrors = 0)
+        replace(next); record(event(next, ForwardEventType.SESSION_RESUME, "恢复校验通过，会话已恢复")); encode(); next
+    }
     @Synchronized fun finish(id: String): Boolean {
         val session = sessions.firstOrNull { it.id == id && it.status != ForwardSessionStatus.COMPLETED } ?: return false
         replace(session.copy(status = ForwardSessionStatus.COMPLETED, endedAt = System.currentTimeMillis()))
@@ -415,6 +436,20 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
             replace(next)
         }
         encode(false)
+    }
+    @Synchronized fun checkHealth(now: Long = System.currentTimeMillis()) {
+        var changed = false
+        sessions.filter { it.status == ForwardSessionStatus.RUNNING }.toList().forEach { source ->
+            val stale = forwardStaleMillis(source, now)
+            forwardHealthReason(healthPolicy, singleGapMillis = stale)?.let { reason ->
+                val next = source.copy(status = ForwardSessionStatus.PAUSED, healthPauseReason = reason,
+                    gapMillis = source.gapMillis + stale, lastMarketAt = 0)
+                replace(next); record(event(next, ForwardEventType.HEALTH_PAUSE, "$reason（健康巡检）"))
+                CryptoNotifications.warn("前向验证已自动暂停：${next.strategyName}", reason)
+                changed = true
+            }
+        }
+        if (changed) encode()
     }
     @Synchronized fun recordSignal(rule: CryptoStrategyRule, quote: CryptoQuote, executionId: String, ready: Boolean, reason: String?) {
         val source = sessionFor(rule.id) ?: return
@@ -494,6 +529,7 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
     private fun changeStatus(id: String, status: ForwardSessionStatus, type: ForwardEventType, message: String): Boolean {
         val source = sessions.firstOrNull { it.id == id && it.status != ForwardSessionStatus.COMPLETED } ?: return false
         replace(source.copy(status = status, lastMarketAt = if (status == ForwardSessionStatus.RUNNING) 0 else source.lastMarketAt,
+            monitoringStartedAt = if (status == ForwardSessionStatus.RUNNING) System.currentTimeMillis() else source.monitoringStartedAt,
             healthPauseReason = if (status == ForwardSessionStatus.RUNNING) "" else source.healthPauseReason,
             consecutiveErrors = if (status == ForwardSessionStatus.RUNNING) 0 else source.consecutiveErrors))
         record(event(source, type, message)); encode(); return true

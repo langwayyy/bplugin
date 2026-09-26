@@ -39,6 +39,7 @@ class CryptoMarketService : Disposable {
         ApplicationManager.getApplication().invokeLater {
             if (disposed) return@invokeLater
             val s = CryptoSettings.getInstance().state
+            ForwardTestService.getInstance().checkHealth()
             if (!s.enabled) { stopRealtime(null); return@invokeLater }
             if (s.pauseInactive && !ApplicationManager.getApplication().isActive) { stopRealtime("后台刷新已暂停"); return@invokeLater }
             val now = System.currentTimeMillis()
