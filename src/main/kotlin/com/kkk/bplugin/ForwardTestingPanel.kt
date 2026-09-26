@@ -81,8 +81,9 @@ class ForwardTestingPanel(private val project: Project?, private val ruleProvide
                     add(historyButton)
                     add(JBLabel("事件")); add(eventType); add(JBLabel("搜索")); add(eventSearch)
                     add(JButton("筛选").apply { addActionListener { updateEventView() } })
-                    add(JButton("导出 CSV").apply { addActionListener { export(false) } })
-                    add(JButton("导出 HTML").apply { addActionListener { export(true) } })
+                    add(JButton("导出 CSV").apply { addActionListener { export("csv") } })
+                    add(JButton("导出 HTML").apply { addActionListener { export("html") } })
+                    add(JButton("导出 JSON").apply { addActionListener { export("json") } })
                 })
             }, BorderLayout.NORTH)
             add(summary, BorderLayout.SOUTH)
@@ -204,11 +205,17 @@ class ForwardTestingPanel(private val project: Project?, private val ruleProvide
         val count = errors.text.toIntOrNull() ?: return message("错误阈值格式无效")
         service.setHealthPolicy(ForwardHealthPolicy(enabled.isSelected, seconds * 1000, count)); refresh(true)
     }
-    private fun export(html: Boolean) {
+    private fun export(format: String) {
         val item = selectedSession() ?: return message("请选择会话")
-        val chooser = JFileChooser().apply { selectedFile = File("${item.symbol}-${item.stage.name.lowercase()}-${if (html) "forward.html" else "events.csv"}") }
+        val suffix = when (format) { "html" -> "forward.html"; "json" -> "audit.json"; else -> "events.csv" }
+        val chooser = JFileChooser().apply { selectedFile = File("${item.symbol}-${item.stage.name.lowercase()}-$suffix") }
         if (chooser.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) return
-        chooser.selectedFile.writeText(if (html) ForwardReportExporter.html(item, events) else ForwardReportExporter.csv(item, events), Charsets.UTF_8)
+        val content = when (format) {
+            "html" -> ForwardReportExporter.html(item, events)
+            "json" -> ForwardReportExporter.json(item, events)
+            else -> ForwardReportExporter.csv(item, events)
+        }
+        chooser.selectedFile.writeText(content, Charsets.UTF_8)
         message("报告已导出：${chooser.selectedFile.absolutePath}")
     }
     private fun updateSummary() {

@@ -1,6 +1,7 @@
 package com.kkk.bplugin
 
 import com.google.gson.Gson
+import com.google.gson.GsonBuilder
 import com.google.gson.reflect.TypeToken
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.PathManager
@@ -373,6 +374,8 @@ internal class ForwardEventJournal(private val root: Path, private val retention
 }
 
 object ForwardReportExporter {
+    data class JsonBundle(val schemaVersion: Int = 1, val generatedAt: Long, val session: ForwardSession,
+                          val events: List<ForwardEvent>, val checksumSha256: String = "")
     fun csv(session: ForwardSession, events: List<ForwardEvent>): String = buildString {
         appendLine("time,type,stage,symbol,price,quantity,fee,pnl,latency_ms,message")
         events.filter { it.sessionId == session.id }.sortedBy(ForwardEvent::time).forEach { e ->
@@ -393,6 +396,20 @@ object ForwardReportExporter {
         }
         return """<!doctype html><html><head><meta charset="utf-8"><title>${esc(session.strategyName)} 前向验证</title><style>body{font:14px sans-serif;margin:28px;color:#222}.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.card{background:#f3f5f7;padding:12px;border-radius:6px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px}.audit{font-family:monospace;color:#555}</style></head><body><h1>${esc(session.strategyName)} · ${session.stage.label}</h1><p class="audit">Lineage ${esc(session.lineageId)} · Session ${esc(session.id)} · Snapshot ${esc(session.snapshotHash)}</p><div class="metrics"><div class="card">归因盈亏 ${metrics.pnl}</div><div class="card">收益 ${metrics.returnPercent}%</div><div class="card">回撤 ${session.maxDrawdownPercent}%</div><div class="card">在线率 ${metrics.uptimePercent}%</div><div class="card">胜率 ${metrics.winRatePercent}%</div><div class="card">Profit Factor ${metrics.profitFactor}</div><div class="card">单笔期望 ${metrics.expectancy}</div><div class="card">手续费 ${session.totalFees}</div><div class="card">滑点成本 ${session.totalSlippage}</div></div><h2>资金曲线</h2><svg viewBox="0 0 900 240" width="100%"><polyline fill="none" stroke="#3978b8" stroke-width="2" points="$points"/></svg><h2>事件</h2><table><tr><th>时间</th><th>类型</th><th>说明</th><th>价格</th><th>盈亏</th></tr>$rows</table><p>报告不包含 API Key、Secret 或账户凭据。</p></body></html>"""
     }
+    fun json(session: ForwardSession, events: List<ForwardEvent>, generatedAt: Long = System.currentTimeMillis()): String {
+        val safeEvents = events.filter { it.sessionId == session.id }.sortedBy(ForwardEvent::time)
+            .map { it.copy(message = redactForwardMessage(it.message)) }
+        val unsigned = JsonBundle(generatedAt = generatedAt, session = session, events = safeEvents)
+        val checksum = sha256(Gson().toJson(unsigned))
+        return GsonBuilder().setPrettyPrinting().create().toJson(unsigned.copy(checksumSha256 = checksum))
+    }
+    fun verifyJson(content: String): Boolean = runCatching {
+        val gson = Gson()
+        val bundle = gson.fromJson(content, JsonBundle::class.java)
+        bundle.checksumSha256.isNotBlank() && bundle.checksumSha256 == sha256(gson.toJson(bundle.copy(checksumSha256 = "")))
+    }.getOrDefault(false)
+    private fun sha256(value: String) = MessageDigest.getInstance("SHA-256")
+        .digest(value.toByteArray(StandardCharsets.UTF_8)).joinToString("") { "%02x".format(it) }
 }
 
 @Service(Service.Level.APP)

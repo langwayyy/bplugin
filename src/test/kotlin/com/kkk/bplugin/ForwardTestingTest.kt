@@ -147,6 +147,17 @@ class ForwardTestingTest : TestCase() {
         assertFalse(html.contains("another-secret"))
     }
 
+    fun testJsonAuditBundleIsRedactedAndTamperEvident() {
+        val session = session(rule())
+        val event = ForwardEvent(sessionId = session.id, time = 1, type = ForwardEventType.ERROR,
+            stage = session.stage, strategyId = session.strategyId, strategyName = session.strategyName,
+            symbol = session.symbol, message = "secret=never-export-this")
+        val json = ForwardReportExporter.json(session, listOf(event), generatedAt = 123)
+        assertTrue(ForwardReportExporter.verifyJson(json))
+        assertFalse(json.contains("never-export-this"))
+        assertFalse(ForwardReportExporter.verifyJson(json.replace("BTCUSDT", "ETHUSDT")))
+    }
+
     private fun session(rule: CryptoStrategyRule) = ForwardSession(strategyId = rule.id, strategyName = rule.name,
         symbol = rule.symbol, stage = ForwardStage.SHADOW, ruleSnapshot = rule, startedAt = 0, expectedIntervalMillis = 10_000)
     private fun rule() = CryptoStrategyRule(name = "forward", symbol = "BTCUSDT", condition = StrategyCondition.PRICE_ABOVE,
