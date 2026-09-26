@@ -51,12 +51,13 @@ class ForwardTestingPanel(private val project: Project?, private val ruleProvide
     }
     private val eventModel = object : AbstractTableModel() {
         override fun getRowCount() = visibleEvents.size
-        override fun getColumnCount() = 9
-        override fun getColumnName(column: Int) = arrayOf("时间", "类型", "阶段", "策略", "交易对", "价格", "数量", "盈亏", "说明")[column]
+        override fun getColumnCount() = 11
+        override fun getColumnName(column: Int) = arrayOf("时间", "类型", "阶段", "策略", "交易对", "价格", "数量", "手续费", "盈亏", "延迟 ms", "说明")[column]
         override fun getValueAt(row: Int, column: Int): Any = visibleEvents[row].let { item -> when (column) {
             0 -> TIME.format(Instant.ofEpochMilli(item.time)); 1 -> item.type.name; 2 -> item.stage.label; 3 -> item.strategyName; 4 -> item.symbol
             5 -> item.price?.let(::marketPrice) ?: "—"; 6 -> item.quantity?.let(::marketPrice) ?: "—"
-            7 -> item.pnl?.let { marketPrice(it, 2) } ?: "—"; else -> item.message
+            7 -> item.fee?.let { marketPrice(it, 4) } ?: "—"; 8 -> item.pnl?.let { marketPrice(it, 2) } ?: "—"
+            9 -> item.latencyMillis?.toString() ?: "—"; else -> item.message
         } }
     }
     private val sessionTable = table(sessionModel)

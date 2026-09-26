@@ -358,8 +358,8 @@ internal class ForwardEventJournal(private val root: Path, private val retention
             if (date != null && date.isBefore(today.minusDays(retentionDays))) Files.deleteIfExists(path)
         } }
     }
-    @Synchronized fun read(from: LocalDate, to: LocalDate, sessionId: String? = null,
-                           types: Set<ForwardEventType> = emptySet(), limit: Int = 5_000): List<ForwardEvent> {
+    fun read(from: LocalDate, to: LocalDate, sessionId: String? = null,
+             types: Set<ForwardEventType> = emptySet(), limit: Int = 5_000): List<ForwardEvent> {
         if (!Files.exists(root) || to.isBefore(from) || limit <= 0) return emptyList()
         val result = mutableListOf<ForwardEvent>()
         val seen = mutableSetOf<String>()

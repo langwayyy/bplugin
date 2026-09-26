@@ -147,6 +147,23 @@ class ForwardTestingTest : TestCase() {
         } finally { root.toFile().deleteRecursively() }
     }
 
+    fun testJournalCanReadWhileNewEventsAreAppended() {
+        val root = Files.createTempDirectory("quiet-forward-concurrent")
+        try {
+            val journal = ForwardEventJournal(root)
+            val now = System.currentTimeMillis()
+            val writer = Thread {
+                (1..100).forEach { index -> journal.append(ForwardEvent(id = "c$index", sessionId = "s", time = now,
+                    type = ForwardEventType.SIGNAL, stage = ForwardStage.SHADOW, strategyId = "r",
+                    strategyName = "rule", symbol = "BTCUSDT")) }
+            }
+            writer.start()
+            repeat(10) { journal.read(LocalDate.now(), LocalDate.now(), limit = 10) }
+            writer.join()
+            assertEquals(100, journal.read(LocalDate.now(), LocalDate.now(), limit = 200).size)
+        } finally { root.toFile().deleteRecursively() }
+    }
+
     fun testExportContainsMetricsButNoCredentialFields() {
         val session = session(rule()).copy(status = ForwardSessionStatus.COMPLETED, endedAt = 2_000)
         val event = ForwardEvent(sessionId = session.id, time = 1, type = ForwardEventType.ERROR, stage = ForwardStage.SHADOW,
