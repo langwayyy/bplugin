@@ -73,6 +73,7 @@ class ForwardTestingPanel(private val project: Project?, private val ruleProvide
                     add(JBLabel("新会话阶段")); add(stage)
                     add(JButton("开始").apply { addActionListener { start() } })
                     add(JButton("暂停 / 恢复").apply { addActionListener { togglePause() } })
+                    add(JButton("全部暂停").apply { addActionListener { pauseAll() } })
                     add(JButton("结束").apply { addActionListener { finish() } })
                     add(JButton("晋级下一阶段").apply { addActionListener { promote() } })
                 })
@@ -155,6 +156,10 @@ class ForwardTestingPanel(private val project: Project?, private val ruleProvide
         if (item.status == ForwardSessionStatus.COMPLETED) return message("已结束的会话不能恢复")
         if (item.status == ForwardSessionStatus.RUNNING) { service.pause(item.id); refresh(true) }
         else service.resume(item.id).onSuccess { refresh(true) }.onFailure { message(it.message ?: "恢复校验失败") }
+    }
+    private fun pauseAll() {
+        val count = service.pauseAll()
+        refresh(true); message(if (count > 0) "已暂停 $count 个运行中的前向会话" else "当前没有运行中的前向会话")
     }
     private fun finish() {
         val item = selectedSession() ?: return message("请选择会话")

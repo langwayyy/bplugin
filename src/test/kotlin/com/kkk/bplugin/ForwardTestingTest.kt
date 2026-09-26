@@ -136,6 +136,17 @@ class ForwardTestingTest : TestCase() {
         assertEquals(2, retained.count { it.status == ForwardSessionStatus.COMPLETED })
     }
 
+    fun testEmergencyPauseOnlyChangesRunningSessions() {
+        val running = session(rule()).copy(id = "running")
+        val alreadyPaused = session(rule()).copy(id = "paused", status = ForwardSessionStatus.PAUSED)
+        val completed = session(rule()).copy(id = "done", status = ForwardSessionStatus.COMPLETED)
+        val (all, changed) = pauseRunningForwardSessions(listOf(running, alreadyPaused, completed), "人工熔断")
+        assertEquals(listOf("running"), changed.map(ForwardSession::id))
+        assertEquals(ForwardSessionStatus.PAUSED, all.first { it.id == "running" }.status)
+        assertEquals("人工熔断", all.first { it.id == "running" }.healthPauseReason)
+        assertEquals(ForwardSessionStatus.COMPLETED, all.first { it.id == "done" }.status)
+    }
+
     fun testJournalReadKeepsNewestEventsWithinLimit() {
         val root = Files.createTempDirectory("quiet-forward-limit")
         try {

@@ -156,6 +156,13 @@ internal fun retainForwardSessions(source: List<ForwardSession>, limit: Int = 10
     val completed = source.filter { it.status == ForwardSessionStatus.COMPLETED }
     return (active + completed.take((limit - active.size).coerceAtLeast(0))).distinctBy(ForwardSession::id)
 }
+internal fun pauseRunningForwardSessions(source: List<ForwardSession>, reason: String): Pair<List<ForwardSession>, List<ForwardSession>> {
+    val changed = source.filter { it.status == ForwardSessionStatus.RUNNING }.map {
+        it.copy(status = ForwardSessionStatus.PAUSED, healthPauseReason = reason.take(240), lastMarketAt = 0)
+    }
+    val byId = changed.associateBy(ForwardSession::id)
+    return source.map { byId[it.id] ?: it } to changed
+}
 internal fun forwardExecutionDelta(previousQuantity: BigDecimal, executedQuantity: BigDecimal,
                                    previousFee: BigDecimal, cumulativeFee: BigDecimal) = ForwardExecutionDelta(
     (executedQuantity - previousQuantity).max(BigDecimal.ZERO),
@@ -530,6 +537,13 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
         record(event(session, ForwardEventType.SESSION_START, "开始 ${stage.label} 前向验证")); encode(); session
     }
     @Synchronized fun pause(id: String) = changeStatus(id, ForwardSessionStatus.PAUSED, ForwardEventType.SESSION_PAUSE, "会话已暂停")
+    @Synchronized fun pauseAll(reason: String = "用户执行全部暂停"): Int {
+        val (updated, changed) = pauseRunningForwardSessions(sessions, reason)
+        if (changed.isEmpty()) return 0
+        sessions = updated.toMutableList()
+        changed.forEach { record(event(it, ForwardEventType.SESSION_PAUSE, reason)) }
+        encode(); return changed.size
+    }
     @Synchronized fun resume(id: String): Result<ForwardSession> = runCatching {
         val source = sessions.firstOrNull { it.id == id && it.status != ForwardSessionStatus.COMPLETED } ?: error("会话不存在或已结束")
         val quote = CryptoMarketService.getInstance().quotes[source.symbol] ?: error("${source.symbol} 尚无行情，不能恢复")
@@ -694,7 +708,7 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
         val source = sessions.firstOrNull { it.id == id && it.status != ForwardSessionStatus.COMPLETED } ?: return false
         replace(source.copy(status = status, lastMarketAt = if (status == ForwardSessionStatus.RUNNING) 0 else source.lastMarketAt,
             monitoringStartedAt = if (status == ForwardSessionStatus.RUNNING) System.currentTimeMillis() else source.monitoringStartedAt,
-            healthPauseReason = if (status == ForwardSessionStatus.RUNNING) "" else source.healthPauseReason,
+            healthPauseReason = if (status == ForwardSessionStatus.RUNNING) "" else source.healthPauseReason.ifBlank { message },
             consecutiveErrors = if (status == ForwardSessionStatus.RUNNING) 0 else source.consecutiveErrors))
         record(event(source, type, message)); encode(); return true
     }
