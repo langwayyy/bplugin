@@ -14,6 +14,7 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption
+import java.security.MessageDigest
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
@@ -35,6 +36,9 @@ data class ForwardSession(
     val symbol: String,
     val stage: ForwardStage,
     val ruleSnapshot: CryptoStrategyRule,
+    val lineageId: String = id,
+    val parentSessionId: String? = null,
+    val snapshotHash: String = forwardRuleFingerprint(ruleSnapshot),
     val status: ForwardSessionStatus = ForwardSessionStatus.RUNNING,
     val startedAt: Long = System.currentTimeMillis(),
     val endedAt: Long? = null,
@@ -98,6 +102,15 @@ internal fun forwardHealthReason(policy: ForwardHealthPolicy, singleGapMillis: L
 internal fun forwardStaleMillis(session: ForwardSession, now: Long): Long {
     val reference = session.lastMarketAt.takeIf { it > 0 } ?: maxOf(session.startedAt, session.monitoringStartedAt)
     return (now - reference - session.expectedIntervalMillis).coerceAtLeast(0)
+}
+internal fun forwardRuleFingerprint(rule: CryptoStrategyRule): String {
+    val canonical = listOf(rule.id, rule.name, rule.symbol, rule.condition.name, rule.threshold.toPlainString(),
+        rule.fastWindow, rule.slowWindow, rule.action.name, rule.side.name, rule.orderTemplate.name,
+        rule.budgetUsdt.toPlainString(), rule.limitOffsetPercent.toPlainString(), rule.targetPercent.toPlainString(),
+        rule.stopPercent.toPlainString(), rule.cooldownMinutes, rule.maxExecutionsPerDay, rule.enabled,
+        (rule.triggerMode ?: StrategyTriggerMode.INTRABAR).name).joinToString("\u001f")
+    return MessageDigest.getInstance("SHA-256").digest(canonical.toByteArray(StandardCharsets.UTF_8))
+        .joinToString("") { "%02x".format(it) }
 }
 data class ForwardPromotionDecision(val allowed: Boolean, val nextStage: ForwardStage?, val reasons: List<String>)
 data class ForwardMetrics(
@@ -273,13 +286,15 @@ internal class ForwardEventJournal(private val root: Path, private val retention
                            types: Set<ForwardEventType> = emptySet(), limit: Int = 5_000): List<ForwardEvent> {
         if (!Files.exists(root) || to.isBefore(from) || limit <= 0) return emptyList()
         val result = mutableListOf<ForwardEvent>()
+        val seen = mutableSetOf<String>()
         var date = to
         while (!date.isBefore(from) && result.size < limit) {
             val path = root.resolve("$date.jsonl")
             if (Files.isRegularFile(path)) Files.readAllLines(path, StandardCharsets.UTF_8).asReversed().forEach { line ->
                 if (result.size >= limit) return@forEach
                 val event = runCatching { gson.fromJson(line, ForwardEvent::class.java) }.getOrNull() ?: return@forEach
-                if ((sessionId == null || event.sessionId == sessionId) && (types.isEmpty() || event.type in types)) result += event
+                if (event.id !in seen && (sessionId == null || event.sessionId == sessionId) &&
+                    (types.isEmpty() || event.type in types)) { seen += event.id; result += event }
             }
             date = date.minusDays(1)
         }
@@ -306,7 +321,7 @@ object ForwardReportExporter {
         val rows = events.filter { it.sessionId == session.id }.sortedByDescending(ForwardEvent::time).joinToString("") {
             "<tr><td>${it.time}</td><td>${it.type}</td><td>${esc(redactForwardMessage(it.message))}</td><td>${it.price ?: "—"}</td><td>${it.pnl ?: "—"}</td></tr>"
         }
-        return """<!doctype html><html><head><meta charset="utf-8"><title>${esc(session.strategyName)} 前向验证</title><style>body{font:14px sans-serif;margin:28px;color:#222}.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.card{background:#f3f5f7;padding:12px;border-radius:6px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px}</style></head><body><h1>${esc(session.strategyName)} · ${session.stage.label}</h1><div class="metrics"><div class="card">归因盈亏 ${metrics.pnl}</div><div class="card">收益 ${metrics.returnPercent}%</div><div class="card">回撤 ${session.maxDrawdownPercent}%</div><div class="card">在线率 ${metrics.uptimePercent}%</div><div class="card">手续费 ${session.totalFees}</div><div class="card">滑点成本 ${session.totalSlippage}</div></div><h2>资金曲线</h2><svg viewBox="0 0 900 240" width="100%"><polyline fill="none" stroke="#3978b8" stroke-width="2" points="$points"/></svg><h2>事件</h2><table><tr><th>时间</th><th>类型</th><th>说明</th><th>价格</th><th>盈亏</th></tr>$rows</table><p>报告不包含 API Key、Secret 或账户凭据。</p></body></html>"""
+        return """<!doctype html><html><head><meta charset="utf-8"><title>${esc(session.strategyName)} 前向验证</title><style>body{font:14px sans-serif;margin:28px;color:#222}.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.card{background:#f3f5f7;padding:12px;border-radius:6px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px}.audit{font-family:monospace;color:#555}</style></head><body><h1>${esc(session.strategyName)} · ${session.stage.label}</h1><p class="audit">Lineage ${esc(session.lineageId)} · Session ${esc(session.id)} · Snapshot ${esc(session.snapshotHash)}</p><div class="metrics"><div class="card">归因盈亏 ${metrics.pnl}</div><div class="card">收益 ${metrics.returnPercent}%</div><div class="card">回撤 ${session.maxDrawdownPercent}%</div><div class="card">在线率 ${metrics.uptimePercent}%</div><div class="card">手续费 ${session.totalFees}</div><div class="card">滑点成本 ${session.totalSlippage}</div></div><h2>资金曲线</h2><svg viewBox="0 0 900 240" width="100%"><polyline fill="none" stroke="#3978b8" stroke-width="2" points="$points"/></svg><h2>事件</h2><table><tr><th>时间</th><th>类型</th><th>说明</th><th>价格</th><th>盈亏</th></tr>$rows</table><p>报告不包含 API Key、Secret 或账户凭据。</p></body></html>"""
     }
 }
 
@@ -314,13 +329,15 @@ object ForwardReportExporter {
 @State(name = "QuietCryptoForwardTesting", storages = [Storage("quiet-crypto-forward.xml")])
 class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredState> {
     data class StoredState(var sessionsJson: String = "[]", var eventsJson: String = "[]", var gateJson: String = "",
-                           var healthPolicyJson: String = "")
+                           var healthPolicyJson: String = "", var pendingJournalJson: String = "[]")
     private val gson = Gson()
     private var stored = StoredState()
     private var sessions = mutableListOf<ForwardSession>()
     private var events = mutableListOf<ForwardEvent>()
     private var gate = ForwardGateConfig()
     private var healthPolicy = ForwardHealthPolicy()
+    private var pendingJournal = mutableListOf<ForwardEvent>()
+    private var journalError: String? = null
     private var lastEncodedAt = 0L
     private val journal by lazy { ForwardEventJournal(Path.of(PathManager.getSystemPath(), "quiet-crypto", "forward-events")) }
 
@@ -330,9 +347,12 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
         stored = state
         sessions = decodeList<ForwardSession>(state.sessionsJson).take(100).map { session ->
             session.copy(healthPauseReason = runCatching { session.healthPauseReason }.getOrNull().orEmpty(),
-                executionQuantities = session.executionQuantities.orEmpty(), terminalExecutions = session.terminalExecutions.orEmpty())
+                executionQuantities = session.executionQuantities.orEmpty(), terminalExecutions = session.terminalExecutions.orEmpty(),
+                lineageId = runCatching { session.lineageId }.getOrNull().orEmpty().ifBlank { session.id },
+                snapshotHash = runCatching { session.snapshotHash }.getOrNull().orEmpty().ifBlank { forwardRuleFingerprint(session.ruleSnapshot) })
         }.toMutableList()
         events = decodeList<ForwardEvent>(state.eventsJson).take(1000).toMutableList()
+        pendingJournal = decodeList<ForwardEvent>(state.pendingJournalJson).take(500).toMutableList()
         gate = runCatching { gson.fromJson(state.gateJson, ForwardGateConfig::class.java) }.getOrNull() ?: ForwardGateConfig()
         healthPolicy = runCatching { gson.fromJson(state.healthPolicyJson, ForwardHealthPolicy::class.java) }.getOrNull() ?: ForwardHealthPolicy()
         val interrupted = sessions.filter { it.status == ForwardSessionStatus.RUNNING }
@@ -341,7 +361,8 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
                 healthPauseReason = "插件重启后需人工确认恢复")
             replace(next); record(event(next, ForwardEventType.RECOVERY, next.healthPauseReason))
         }
-        if (interrupted.isNotEmpty()) encode()
+        flushPendingJournal()
+        if (interrupted.isNotEmpty() || pendingJournal.isNotEmpty()) encode()
     }
     @Synchronized fun sessions() = sessions.toList()
     @Synchronized fun events() = events.toList()
@@ -355,7 +376,8 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
         val gaps = sessions.sumOf(ForwardSession::gapMillis)
         val recovery = sessions.count { it.status == ForwardSessionStatus.RECOVERY_REQUIRED }
         val unhealthy = sessions.count { it.healthPauseReason.isNotBlank() }
-        return "前向验证: $active 个活动会话 / ${sessions.size} 个会话, ${events.size} 条近期事件, 待恢复 $recovery, 健康暂停 $unhealthy, 累计数据缺口 ${gaps / 1000} 秒\n"
+        val journalState = journalError?.let { "日志待重试 ${pendingJournal.size} 条 (${redactForwardMessage(it)})" } ?: "日志正常"
+        return "前向验证: $active 个活动会话 / ${sessions.size} 个会话, ${events.size} 条近期事件, 待恢复 $recovery, 健康暂停 $unhealthy, 累计数据缺口 ${gaps / 1000} 秒, $journalState\n"
     }
     @Synchronized fun gate() = gate
     @Synchronized fun healthPolicy() = healthPolicy
@@ -372,7 +394,8 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
     @Synchronized fun sessionFor(strategyId: String): ForwardSession? = sessions.firstOrNull {
         it.strategyId == strategyId && it.status != ForwardSessionStatus.COMPLETED
     }
-    @Synchronized fun start(rule: CryptoStrategyRule, stage: ForwardStage): Result<ForwardSession> = runCatching {
+    @Synchronized fun start(rule: CryptoStrategyRule, stage: ForwardStage, parentSessionId: String? = null,
+                            lineageId: String? = null): Result<ForwardSession> = runCatching {
         require(sessionFor(rule.id) == null) { "该策略已有未结束的前向会话" }
         require(sessions.none { it.status != ForwardSessionStatus.COMPLETED && it.symbol == rule.symbol && it.stage == stage }) {
             "同一交易对在该阶段已有活动会话，无法准确归因"
@@ -383,7 +406,8 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
             require(measured.signum() > 0) { "测试网资产尚未同步，不能开始前向会话" }
         val equity = measured.takeIf { it.signum() > 0 } ?: BigDecimal("10000")
         val session = ForwardSession(strategyId = rule.id, strategyName = rule.name, symbol = rule.symbol, stage = stage,
-            ruleSnapshot = rule, startedAt = now, expectedIntervalMillis = expectedInterval(rule), initialEquity = equity,
+            ruleSnapshot = rule, parentSessionId = parentSessionId, lineageId = lineageId ?: UUID.randomUUID().toString(),
+            startedAt = now, expectedIntervalMillis = expectedInterval(rule), initialEquity = equity,
             currentEquity = equity, peakEquity = equity, cash = equity, equityCurve = listOf(ForwardPoint(now, equity)))
         sessions.add(0, session); record(event(session, ForwardEventType.SESSION_START, "开始 ${stage.label} 前向验证")); encode(); session
     }
@@ -417,7 +441,7 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
         val decision = ForwardEngine.promotion(source, gate)
         require(decision.allowed) { decision.reasons.joinToString("；") }
         val next = requireNotNull(decision.nextStage)
-        val created = start(source.ruleSnapshot, next).getOrThrow()
+        val created = start(source.ruleSnapshot, next, source.id, source.lineageId).getOrThrow()
         record(event(created, ForwardEventType.PROMOTION, "由 ${source.stage.label} 晋级")); encode(); created
     }
     @Synchronized fun onMarket(quote: CryptoQuote, closedCandle: Boolean = false) {
@@ -537,7 +561,19 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
     private fun replace(value: ForwardSession) { sessions = sessions.map { if (it.id == value.id) value else it }.toMutableList() }
     private fun record(value: ForwardEvent) {
         val safe = value.copy(message = redactForwardMessage(value.message))
-        events.add(0, safe); events = events.take(1000).toMutableList(); runCatching { journal.append(safe) }
+        events.add(0, safe); events = events.take(1000).toMutableList()
+        pendingJournal += safe
+        if (pendingJournal.size > 500) pendingJournal = pendingJournal.takeLast(500).toMutableList()
+        flushPendingJournal()
+    }
+    private fun flushPendingJournal() {
+        while (pendingJournal.isNotEmpty()) {
+            val next = pendingJournal.first()
+            val failure = runCatching { journal.append(next) }.exceptionOrNull()
+            if (failure != null) { journalError = failure.message ?: failure.javaClass.simpleName; return }
+            pendingJournal.removeAt(0)
+        }
+        journalError = null
     }
     private fun event(session: ForwardSession, type: ForwardEventType, message: String, executionId: String = "",
                       price: BigDecimal? = null, quantity: BigDecimal? = null, latencyMillis: Long? = null,
@@ -561,6 +597,7 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
         if (!force && now - lastEncodedAt < 5_000) return
         stored.sessionsJson = gson.toJson(sessions.take(100)); stored.eventsJson = gson.toJson(events.take(1000)); stored.gateJson = gson.toJson(gate)
         stored.healthPolicyJson = gson.toJson(healthPolicy)
+        stored.pendingJournalJson = gson.toJson(pendingJournal.takeLast(500))
         lastEncodedAt = now
     }
     private inline fun <reified T> decodeList(json: String): List<T> = runCatching {

@@ -53,6 +53,7 @@ class ForwardTestingTest : TestCase() {
             assertFalse(Files.exists(old))
             val today = root.resolve("${LocalDate.now()}.jsonl")
             assertTrue(Files.readString(today).contains("\"SIGNAL\""))
+            journal.append(event)
             Files.writeString(today, "not-json\n", java.nio.file.StandardOpenOption.APPEND)
             val loaded = journal.read(LocalDate.now(), LocalDate.now(), sessionId = "s")
             assertEquals(1, loaded.size)
@@ -74,6 +75,13 @@ class ForwardTestingTest : TestCase() {
         assertEquals(0, forwardStaleMillis(source, 59_999))
         assertEquals(5_000, forwardStaleMillis(source, 65_000))
         assertEquals(2_000, forwardStaleMillis(source.copy(lastMarketAt = 60_000), 72_000))
+    }
+
+    fun testStrategySnapshotFingerprintIsStableAndSensitiveToExecutionFields() {
+        val source = rule()
+        assertEquals(forwardRuleFingerprint(source), forwardRuleFingerprint(source.copy()))
+        assertFalse(forwardRuleFingerprint(source).isBlank())
+        assertFalse(forwardRuleFingerprint(source) == forwardRuleFingerprint(source.copy(budgetUsdt = BigDecimal("1001"))))
     }
 
     fun testExportContainsMetricsButNoCredentialFields() {
