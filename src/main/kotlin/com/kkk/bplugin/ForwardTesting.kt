@@ -130,6 +130,8 @@ data class ForwardMetrics(
 )
 data class ForwardTransition(val session: ForwardSession, val events: List<ForwardEvent> = emptyList())
 data class ForwardExecutionDelta(val quantity: BigDecimal, val fee: BigDecimal, val recordedFee: BigDecimal)
+internal fun mergeForwardEvents(recent: List<ForwardEvent>, historical: List<ForwardEvent>, limit: Int = 5_000): List<ForwardEvent> =
+    (recent + historical).distinctBy(ForwardEvent::id).sortedByDescending(ForwardEvent::time).take(limit)
 internal fun forwardExecutionDelta(previousQuantity: BigDecimal, executedQuantity: BigDecimal,
                                    previousFee: BigDecimal, cumulativeFee: BigDecimal) = ForwardExecutionDelta(
     (executedQuantity - previousQuantity).max(BigDecimal.ZERO),
@@ -429,7 +431,7 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
     }
     @Synchronized fun sessions() = sessions.toList()
     @Synchronized fun events() = events.toList()
-    @Synchronized fun historicalEvents(sessionId: String? = null, days: Long = 30, limit: Int = 5_000): List<ForwardEvent> {
+    fun historicalEvents(sessionId: String? = null, days: Long = 30, limit: Int = 5_000): List<ForwardEvent> {
         val today = LocalDate.now()
         return journal.read(today.minusDays(days.coerceIn(1, 30) - 1), today, sessionId, limit = limit.coerceIn(1, 20_000))
     }

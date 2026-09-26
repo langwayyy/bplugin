@@ -116,6 +116,13 @@ class ForwardTestingTest : TestCase() {
         assertEquals(0, ForwardEngine.metrics(reconciled).expectancy.compareTo(BigDecimal("9")))
     }
 
+    fun testRecentAndHistoricalEventsMergeWithoutDuplicates() {
+        val base = ForwardEvent(id = "same", sessionId = "s", time = 1, type = ForwardEventType.SIGNAL,
+            stage = ForwardStage.SHADOW, strategyId = "r", strategyName = "rule", symbol = "BTCUSDT")
+        val newer = base.copy(id = "new", time = 2)
+        assertEquals(listOf("new", "same"), mergeForwardEvents(listOf(newer, base), listOf(base)).map(ForwardEvent::id))
+    }
+
     fun testExportContainsMetricsButNoCredentialFields() {
         val session = session(rule()).copy(status = ForwardSessionStatus.COMPLETED, endedAt = 2_000)
         val event = ForwardEvent(sessionId = session.id, time = 1, type = ForwardEventType.ERROR, stage = ForwardStage.SHADOW,

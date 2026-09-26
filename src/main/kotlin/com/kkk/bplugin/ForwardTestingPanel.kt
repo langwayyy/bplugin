@@ -1,6 +1,7 @@
 package com.kkk.bplugin
 
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.Messages
 import com.intellij.ui.JBColor
@@ -27,10 +28,12 @@ class ForwardTestingPanel(private val project: Project?, private val ruleProvide
     private var sessions = emptyList<ForwardSession>()
     private var events = emptyList<ForwardEvent>()
     private var visibleEvents = emptyList<ForwardEvent>()
+    private var historicalCache = emptyList<ForwardEvent>()
     private val stage = ComboBox(ForwardStage.entries.toTypedArray())
     private val summary = JBLabel("尚无前向验证会话")
     private val eventType = ComboBox(arrayOf("全部") + ForwardEventType.entries.map(ForwardEventType::name).toTypedArray())
     private val eventSearch = JTextField(12)
+    private val historyButton = JButton("加载30天日志").apply { addActionListener { toggleHistory() } }
     private val chart = ForwardEquityChart { selectedSession() }
     private val sessionModel = object : AbstractTableModel() {
         override fun getRowCount() = sessions.size
@@ -75,7 +78,7 @@ class ForwardTestingPanel(private val project: Project?, private val ruleProvide
                 add(JPanel(FlowLayout(FlowLayout.LEFT)).apply {
                     add(JButton("晋级门槛").apply { addActionListener { editGate() } })
                     add(JButton("健康策略").apply { addActionListener { editHealthPolicy() } })
-                    add(JButton("加载30天日志").apply { addActionListener { includeHistory = true; refresh(true) } })
+                    add(historyButton)
                     add(JBLabel("事件")); add(eventType); add(JBLabel("搜索")); add(eventSearch)
                     add(JButton("筛选").apply { addActionListener { updateEventView() } })
                     add(JButton("导出 CSV").apply { addActionListener { export(false) } })
@@ -95,7 +98,8 @@ class ForwardTestingPanel(private val project: Project?, private val ruleProvide
 
     fun refresh(force: Boolean = false) {
         val nextSessions = service.sessions()
-        val nextEvents = if (includeHistory) service.historicalEvents() else service.events()
+        val recent = service.events()
+        val nextEvents = if (includeHistory) mergeForwardEvents(recent, historicalCache) else recent
         val next = "${nextSessions.take(50)}|${nextEvents.take(50)}|${service.gate()}|${service.healthPolicy()}|$includeHistory"
         if (!force && next == fingerprint) return
         fingerprint = next; sessions = nextSessions; events = nextEvents
@@ -114,6 +118,22 @@ class ForwardTestingPanel(private val project: Project?, private val ruleProvide
             .filter { query.isBlank() || listOf(it.message, it.executionId, it.strategyName, it.symbol).any { value -> value.contains(query, true) } }
             .toList()
         eventModel.fireTableDataChanged()
+    }
+    private fun toggleHistory() {
+        if (includeHistory) {
+            includeHistory = false; historicalCache = emptyList(); historyButton.text = "加载30天日志"; refresh(true); return
+        }
+        historyButton.isEnabled = false; message("正在后台读取最近30天事件…")
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val result = runCatching { service.historicalEvents() }
+            ApplicationManager.getApplication().invokeLater {
+                historyButton.isEnabled = true
+                result.onSuccess {
+                    historicalCache = it; includeHistory = true; historyButton.text = "返回近期事件"; refresh(true)
+                    message("已加载 ${it.size} 条磁盘事件")
+                }.onFailure { message("历史事件读取失败：${it.message}") }
+            }
+        }
     }
     private fun start() {
         val rule = ruleProvider() ?: return message("请先在“策略”页选择一个策略")
