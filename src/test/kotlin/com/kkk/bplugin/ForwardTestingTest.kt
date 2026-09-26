@@ -39,10 +39,13 @@ class ForwardTestingTest : TestCase() {
     fun testPromotionRequiresCompletedReliableSample() {
         val source = session(rule()).copy(status = ForwardSessionStatus.COMPLETED, endedAt = 20_000,
             signals = 20, orders = 10, fills = 9, errors = 1, startedAt = 10_000, gapMillis = 0,
-            maxDrawdownPercent = BigDecimal("5"))
+            maxDrawdownPercent = BigDecimal("5"), closedTrades = 5, winningTrades = 3, losingTrades = 2,
+            grossProfit = BigDecimal("30"), grossLoss = BigDecimal("20"), realizedPnl = BigDecimal("10"))
         assertTrue(ForwardEngine.promotion(source, ForwardGateConfig()).allowed)
         val unreliable = source.copy(gapMillis = 9_000)
         assertFalse(ForwardEngine.promotion(unreliable, ForwardGateConfig()).allowed)
+        assertFalse(ForwardEngine.promotion(source.copy(closedTrades = 4), ForwardGateConfig()).allowed)
+        assertFalse(ForwardEngine.promotion(source.copy(grossProfit = BigDecimal("10"), grossLoss = BigDecimal("20")), ForwardGateConfig()).allowed)
     }
 
     fun testJournalAppendsDailyJsonAndPurgesExpiredFiles() {

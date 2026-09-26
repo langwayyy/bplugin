@@ -149,16 +149,24 @@ class ForwardTestingPanel(private val project: Project?, private val ruleProvide
         val drawdown = JTextField(current.maxDrawdownPercent.toPlainString(), 7)
         val errors = JTextField(current.maxErrorRatePercent.toPlainString(), 7)
         val uptime = JTextField(current.minUptimePercent.toPlainString(), 7)
+        val closedTrades = JTextField((current.minClosedTrades ?: 5).toString(), 7)
+        val profitFactor = JTextField((current.minProfitFactor ?: BigDecimal.ONE).toPlainString(), 7)
+        val expectancy = JTextField((current.minExpectancy ?: BigDecimal.ZERO).toPlainString(), 7)
         val panel = JPanel(java.awt.GridLayout(0, 2, 8, 6)).apply {
             add(JLabel("最少信号数")); add(signals); add(JLabel("最大回撤 %")); add(drawdown)
             add(JLabel("最大错误率 %")); add(errors); add(JLabel("最低在线率 %")); add(uptime)
+            add(JLabel("最少平仓样本")); add(closedTrades); add(JLabel("最低 Profit Factor")); add(profitFactor)
+            add(JLabel("最低单笔期望")); add(expectancy)
         }
         if (JOptionPane.showConfirmDialog(this, panel, "前向验证晋级门槛", JOptionPane.OK_CANCEL_OPTION,
                 JOptionPane.PLAIN_MESSAGE) != JOptionPane.OK_OPTION) return
         val value = ForwardGateConfig(signals.text.toIntOrNull() ?: return message("最少信号数格式无效"),
             drawdown.text.toBigDecimalOrNull() ?: return message("最大回撤格式无效"),
             errors.text.toBigDecimalOrNull() ?: return message("错误率格式无效"),
-            uptime.text.toBigDecimalOrNull() ?: return message("在线率格式无效"))
+            uptime.text.toBigDecimalOrNull() ?: return message("在线率格式无效"),
+            closedTrades.text.toIntOrNull() ?: return message("平仓样本格式无效"),
+            profitFactor.text.toBigDecimalOrNull() ?: return message("Profit Factor 格式无效"),
+            expectancy.text.toBigDecimalOrNull() ?: return message("单笔期望格式无效"))
         service.setGate(value); refresh(true)
     }
     private fun editHealthPolicy() {

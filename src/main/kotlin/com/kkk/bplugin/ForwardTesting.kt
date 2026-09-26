@@ -93,6 +93,9 @@ data class ForwardGateConfig(
     val maxDrawdownPercent: BigDecimal = BigDecimal("10"),
     val maxErrorRatePercent: BigDecimal = BigDecimal("10"),
     val minUptimePercent: BigDecimal = BigDecimal("95"),
+    val minClosedTrades: Int? = 5,
+    val minProfitFactor: BigDecimal? = BigDecimal.ONE,
+    val minExpectancy: BigDecimal? = BigDecimal.ZERO,
 )
 data class ForwardHealthPolicy(
     val autoPause: Boolean = true,
@@ -218,6 +221,12 @@ internal object ForwardEngine {
         val reasons = buildList {
             if (session.status != ForwardSessionStatus.COMPLETED) add("请先结束当前会话")
             if (session.signals < gate.minSignals) add("信号样本 ${session.signals}/${gate.minSignals}")
+            val requiredTrades = gate.minClosedTrades ?: 5
+            val requiredProfitFactor = gate.minProfitFactor ?: BigDecimal.ONE
+            val requiredExpectancy = gate.minExpectancy ?: BigDecimal.ZERO
+            if (session.closedTrades < requiredTrades) add("平仓样本 ${session.closedTrades}/$requiredTrades")
+            if (metrics.profitFactor < requiredProfitFactor) add("Profit Factor ${metrics.profitFactor} 低于 $requiredProfitFactor")
+            if (metrics.expectancy < requiredExpectancy) add("单笔期望 ${metrics.expectancy} 低于 $requiredExpectancy")
             if (session.maxDrawdownPercent > gate.maxDrawdownPercent) add("最大回撤 ${session.maxDrawdownPercent}% 超过 ${gate.maxDrawdownPercent}%")
             if (metrics.errorRatePercent > gate.maxErrorRatePercent) add("错误率 ${metrics.errorRatePercent}% 超过 ${gate.maxErrorRatePercent}%")
             if (metrics.uptimePercent < gate.minUptimePercent) add("数据在线率 ${metrics.uptimePercent}% 低于 ${gate.minUptimePercent}%")
@@ -443,7 +452,10 @@ class ForwardTestService : PersistentStateComponent<ForwardTestService.StoredSta
         gate = value.copy(minSignals = value.minSignals.coerceIn(1, 10_000),
             maxDrawdownPercent = value.maxDrawdownPercent.coerceIn(BigDecimal("0.1"), BigDecimal("100")),
             maxErrorRatePercent = value.maxErrorRatePercent.coerceIn(BigDecimal.ZERO, BigDecimal("100")),
-            minUptimePercent = value.minUptimePercent.coerceIn(BigDecimal.ZERO, BigDecimal("100"))); encode()
+            minUptimePercent = value.minUptimePercent.coerceIn(BigDecimal.ZERO, BigDecimal("100")),
+            minClosedTrades = (value.minClosedTrades ?: 5).coerceIn(1, 10_000),
+            minProfitFactor = (value.minProfitFactor ?: BigDecimal.ONE).coerceIn(BigDecimal.ZERO, BigDecimal("999")),
+            minExpectancy = (value.minExpectancy ?: BigDecimal.ZERO).coerceIn(BigDecimal("-1000000"), BigDecimal("1000000"))); encode()
     }
     @Synchronized fun sessionFor(strategyId: String): ForwardSession? = sessions.firstOrNull {
         it.strategyId == strategyId && it.status != ForwardSessionStatus.COMPLETED
